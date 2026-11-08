@@ -1,0 +1,37 @@
+name: solar_family_monitor
+description: Aplicación familiar multiplataforma (Flutter) para monitoreo solar local en tiempo real vía MQTT con alertas críticas y gráficas interactivas.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.2.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # Cliente MQTT robusto con reconexión automática para red local
+  mqtt_client: ^10.2.0
+  # Gráficas dinámicas e interactivas con soporte de zoom, paneo y tooltips
+  fl_chart: ^0.68.0
+  # Notificaciones locales (Notificación permanente en barra de estado y alertas críticas)
+  flutter_local_notifications: ^17.1.2
+  # Servicio en segundo plano para mantener la notificación fija y vigilancia MQTT
+  flutter_foreground_task: ^8.3.0
+  # Alarma sonora tipo llamada entrante cuando la batería baja del 30%
+  flutter_ringtone_player: ^4.0.0+2
+  # Persistencia local de configuración (IP de la MacBook, umbrales, historial en caché)
+  shared_preferences: ^2.2.3
+  # Formateo de fechas y marcas de tiempo exactas en gráficas
+  intl: ^0.19.0
+  # Envío directo opcional a Telegram Bot API desde el celular como respaldo
+  http: ^1.2.1
+  # Iconos Material y Cupertino
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true

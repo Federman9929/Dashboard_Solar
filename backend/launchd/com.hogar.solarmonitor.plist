@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Identificador único del servicio LaunchAgent para el lector Solar Python -->
+    <key>Label</key>
+    <string>com.hogar.solarmonitor</string>
+
+    <!-- Ejecuta el script dentro del entorno virtual de Python del proyecto -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/federico/Documents/Federico2026/Panel_Solar/backend/venv/bin/python3</string>
+        <string>/Users/federico/Documents/Federico2026/Panel_Solar/backend/solar_monitor.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/federico/Documents/Federico2026/Panel_Solar/backend</string>
+
+    <!-- Iniciar automáticamente al iniciar sesión en la MacBook -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Mantener siempre vivo en segundo plano -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/federico/Documents/Federico2026/Panel_Solar/backend/logs/launchd_solar_stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/federico/Documents/Federico2026/Panel_Solar/backend/logs/launchd_solar_stderr.log</string>
+</dict>
+</plist>

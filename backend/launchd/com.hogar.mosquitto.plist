@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Identificador único del servicio LaunchAgent para Mosquitto -->
+    <key>Label</key>
+    <string>com.hogar.mosquitto</string>
+
+    <!-- Comando de ejecución (compatible con Apple Silicon /opt/homebrew e Intel /usr/local) -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/sbin/mosquitto</string>
+        <string>-c</string>
+        <string>/Users/federico/Documents/Federico2026/Panel_Solar/backend/mosquitto/mosquitto_solar.conf</string>
+    </array>
+
+    <!-- Iniciar automáticamente al encender / iniciar sesión en la Mac -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Reiniciar automáticamente si el proceso se detiene por cualquier motivo -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Retraso de seguridad entre reinicios (segundos) -->
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/federico/Documents/Federico2026/Panel_Solar/backend</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/federico/Documents/Federico2026/Panel_Solar/backend/logs/mosquitto_stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/federico/Documents/Federico2026/Panel_Solar/backend/logs/mosquitto_stderr.log</string>
+</dict>
+</plist>

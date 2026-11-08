@@ -1,0 +1,23 @@
+# Python & Backend Local
+backend/venv/
+backend/__pycache__/
+backend/*.pyc
+backend/.env
+backend/logs/
+backend/*.db
+
+# macOS
+.DS_Store
+
+# Flutter / Dart / Android / iOS
+solar_family_app/.dart_tool/
+solar_family_app/.packages
+solar_family_app/build/
+solar_family_app/.flutter-plugins
+solar_family_app/.flutter-plugins-dependencies
+solar_family_app/android/.gradle/
+solar_family_app/android/local.properties
+solar_family_app/ios/Pods/
+solar_family_app/ios/.symlinks/
+solar_family_app/*.iml
+solar_family_app/.idea/
