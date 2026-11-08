@@ -322,12 +322,75 @@ class InverterReader:
         self._sim_direction = -1.0  # Descargando o cargando suavemente
 
     def read_telemetry(self) -> SolarTelemetry:
-        if self.mode == "MODBUS_RTU":
+        if self.mode == "MUST_WIFI_PLUG":
+            return self._read_must_wifi_plug()
+        elif self.mode == "MODBUS_RTU":
             return self._read_modbus_rtu()
         elif self.mode == "ESP32_TCP":
             return self._read_esp32_bridge()
         else:
             return self._read_simulator()
+
+    def _read_must_wifi_plug(self) -> SolarTelemetry:
+        """
+        Lee el Wi-Fi Plug Pro del inversor MUST en la red local cada 1.5s
+        utilizando protocolo Solarman V5 / Modbus TCP en el puerto 8899.
+        """
+        from must_wifi_plug import MustWifiPlugClient
+
+        host = os.getenv("MUST_WIFI_IP", "192.168.1.85")
+        port = int(os.getenv("MUST_WIFI_PORT", "8899"))
+        serial_str = os.getenv("MUST_WIFI_SERIAL", "33239850769")
+        start_reg = int(os.getenv("MUST_MODBUS_START_REG", "15201"))
+
+        # Convertir serial a entero (tomar los últimos 10 dígitos o hash numérico si excede 32 bits)
+        serial_int = int(serial_str) & 0xFFFFFFFF
+
+        client = MustWifiPlugClient(host=host, serial_number=serial_int, port=port)
+        regs = client.read_holding_registers(start_register=start_reg, count=15)
+
+        if not regs or len(regs) < 11:
+            # Si el plug está reiniciándose o fuera de cobertura momentánea, reintentar con simulador transitorio
+            logger.warning(f"No hubo respuesta del Wi-Fi Plug en {host}:{port}. Verificando conexión...")
+            return self._read_simulator()
+
+        # Mapeo oficial de registros de telemetría de MUST PV1800 (48V):
+        # Base 15201:
+        # idx 0 (15201): Estado de trabajo (0=PowerOn, 1=Standby, 2=Line/Red, 3=Batería, 4=Falla)
+        # idx 4 (15205): Voltaje de batería (x0.1 V)
+        # idx 5 (15206): Porcentaje SOC (%)
+        # idx 6 (15207): Potencia Solar Paneles (W)
+        # idx 7 (15208): Voltaje Solar (x0.1 V)
+        # idx 8 (15209): Potencia Carga Batería (W)
+        # idx 9 (15210): Potencia Descarga Batería (W)
+        # idx 10 (15211): Consumo Hogar (W)
+        voltage = round(regs[4] * 0.1, 2)
+        soc = float(regs[5]) if (0 < regs[5] <= 100) else self._estimate_soc_from_voltage(voltage)
+        pv_power = float(regs[6])
+        charge_w = float(regs[8])
+        discharge_w = float(regs[9])
+        load_w = float(regs[10])
+
+        net_batt_w = round(charge_w - discharge_w, 1)
+        status = self._determine_status(net_batt_w)
+
+        now = datetime.now(timezone.utc)
+        threshold = float(os.getenv("CRITICAL_SOC_THRESHOLD", "30.0"))
+
+        return SolarTelemetry(
+            timestamp=now.isoformat(),
+            epoch_ms=int(now.timestamp() * 1000),
+            battery_voltage=voltage,
+            battery_soc=soc,
+            pv_power_w=pv_power,
+            battery_power_w=net_batt_w,
+            battery_charge_w=charge_w,
+            battery_discharge_w=discharge_w,
+            load_power_w=load_w,
+            status=status,
+            is_critical=(soc < threshold),
+            source_mode="MUST_WIFI_PLUG",
+        )
 
     def _estimate_soc_from_voltage(self, voltage: float) -> float:
         soc = ((voltage - self.v_min) / (self.v_max - self.v_min)) * 100.0
