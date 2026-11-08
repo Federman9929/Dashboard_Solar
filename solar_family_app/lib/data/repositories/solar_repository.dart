@@ -27,11 +27,11 @@ class SolarRepository {
   static const String _prefTelegramChatId = 'telegram_chat_id';
   static const String _prefDemoMode = 'demo_mode_enabled';
 
-  String _brokerHost = '192.168.1.100';
+  String _brokerHost = '10.0.2.2';
   int _brokerPort = 1883;
   String _telegramBotToken = '';
   String _telegramChatId = '';
-  bool _demoMode = false;
+  bool _demoMode = true;
   Timer? _demoTimer;
 
   String get brokerHost => _brokerHost;
@@ -70,11 +70,11 @@ class SolarRepository {
     await _notificationService.initialize();
 
     final prefs = await SharedPreferences.getInstance();
-    _brokerHost = prefs.getString(_prefBrokerHost) ?? '192.168.1.100';
+    _brokerHost = prefs.getString(_prefBrokerHost) ?? '10.0.2.2';
     _brokerPort = prefs.getInt(_prefBrokerPort) ?? 1883;
     _telegramBotToken = prefs.getString(_prefTelegramToken) ?? '';
     _telegramChatId = prefs.getString(_prefTelegramChatId) ?? '';
-    _demoMode = prefs.getBool(_prefDemoMode) ?? false;
+    _demoMode = prefs.getBool(_prefDemoMode) ?? true;
 
     // Pre-cargar curva inicial de 24h por si aún no responde la red local
     _seedInitialHistoryIfNeeded();
