@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
 
-import '../../../../data/services/mqtt_solar_service.dart';
-import '../../../../domain/models/solar_reading.dart';
-import '../../view_models/solar_dashboard_view_model.dart';
+import 'package:solar_family_monitor/data/services/mqtt_solar_service.dart';
+import 'package:solar_family_monitor/domain/models/solar_reading.dart';
+import 'package:solar_family_monitor/ui/features/dashboard/view_models/solar_dashboard_view_model.dart';
 import 'widgets/interactive_solar_chart.dart';
 
 class SolarDashboardScreen extends StatelessWidget {

@@ -1,9 +1,9 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 
-import '../../../data/repositories/solar_repository.dart';
-import '../../../data/services/mqtt_solar_service.dart';
-import '../../../domain/models/solar_reading.dart';
+import 'package:solar_family_monitor/data/repositories/solar_repository.dart';
+import 'package:solar_family_monitor/data/services/mqtt_solar_service.dart';
+import 'package:solar_family_monitor/domain/models/solar_reading.dart';
 
 class SolarDashboardViewModel extends ChangeNotifier {
   SolarDashboardViewModel({required SolarRepository repository})

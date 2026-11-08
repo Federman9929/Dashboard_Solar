@@ -4,7 +4,7 @@ import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
-import '../../../../domain/models/solar_reading.dart';
+import 'package:solar_family_monitor/domain/models/solar_reading.dart';
 
 /// Gráfica Dinámica e Interactiva basada en `fl_chart`.
 /// Soporta:
