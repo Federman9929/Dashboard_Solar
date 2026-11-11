@@ -27,7 +27,12 @@ echo "=================================================================="
 echo "🔋 PASO 2: Iniciando Servidor Solar Python (SmartESS -> MQTT)"
 echo "=================================================================="
 pkill -f "solar_monitor.py" 2>/dev/null || true
-nohup python3 "$BACKEND_DIR/solar_monitor.py" > "$BACKEND_DIR/logs/solar_monitor_live.log" 2>&1 &
+if [ -x "$BACKEND_DIR/venv/bin/python3" ]; then
+    PYTHON_BIN="$BACKEND_DIR/venv/bin/python3"
+else
+    PYTHON_BIN="/usr/bin/python3"
+fi
+nohup "$PYTHON_BIN" "$BACKEND_DIR/solar_monitor.py" > "$BACKEND_DIR/logs/solar_monitor_live.log" 2>&1 &
 echo "✅ Servicio Python iniciado (conectado a tu planta Casa_Falla)."
 
 echo ""

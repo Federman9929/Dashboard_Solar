@@ -24,9 +24,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
-import paho.mqtt.client as mqtt
-import requests
-from dotenv import load_dotenv
+# Auto-activar el entorno virtual local (venv) si el usuario ejecuta `python3 solar_monitor.py`
+# desde una terminal cuyo `python3` global no tiene instalado paho-mqtt.
+_BASE_DIR_EARLY = Path(__file__).resolve().parent
+_VENV_PYTHON = _BASE_DIR_EARLY / "venv" / "bin" / "python3"
+try:
+    import paho.mqtt.client as mqtt
+    import requests
+    from dotenv import load_dotenv
+except ModuleNotFoundError:
+    if _VENV_PYTHON.exists() and os.environ.get("_SOLAR_VENV_REDIRECTED") != "1":
+        os.environ["_SOLAR_VENV_REDIRECTED"] = "1"
+        os.execv(str(_VENV_PYTHON), [str(_VENV_PYTHON), *sys.argv])
+    raise
 
 # Cargar variables de entorno desde archivo .env si existe
 BASE_DIR = Path(__file__).resolve().parent
