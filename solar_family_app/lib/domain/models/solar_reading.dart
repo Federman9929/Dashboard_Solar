@@ -46,13 +46,17 @@ class SolarReading {
   final String sourceMode;
 
   /// Determina si el indicador visual de la notificación permanente y UI
-  /// debe ser verde (cargando o nivel saludable >= 50% sin descarga severa)
-  /// o rojo (descargando o nivel bajo < 30%).
-  bool get isHealthyGreen =>
-      !isCritical &&
-      batterySoc >= 30.0 &&
+  /// debe ser verde (cargando o nivel saludable por encima del umbral)
+  /// o rojo (descargando o nivel por debajo del umbral configurado).
+  bool isHealthyForThreshold(double threshold) =>
+      batterySoc >= threshold &&
       (status == SolarSystemStatus.charging ||
-          (status == SolarSystemStatus.idle && batterySoc >= 50.0));
+          (status == SolarSystemStatus.idle && batterySoc >= threshold));
+
+  bool get isHealthyGreen => isHealthyForThreshold(30.0);
+
+  String statusEmojiForThreshold(double threshold) =>
+      isHealthyForThreshold(threshold) ? '🟢' : '🔴';
 
   String get statusEmoji => isHealthyGreen ? '🟢' : '🔴';
 

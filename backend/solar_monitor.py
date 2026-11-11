@@ -678,10 +678,16 @@ class SolarBackendService:
             logger.info(f"Comando recibido en {msg.topic}: {payload}")
             if payload == "GET_HISTORY":
                 self._publish_24h_history()
+            elif payload.startswith("SET_THRESHOLD:"):
+                new_val = float(payload.split(":", 1)[1])
+                new_val = max(5.0, min(95.0, new_val))
+                os.environ["CRITICAL_SOC_THRESHOLD"] = str(new_val)
+                self.alert_manager.threshold_soc = new_val
+                logger.info(f"Umbral de alerta de batería actualizado a {new_val:.1f}% desde la App.")
             elif payload == "TEST_CRITICAL_ALERT":
                 # Permite probar el sistema de alerta crítica desde la app móvil
                 sample = self.reader.read_telemetry()
-                sample.battery_soc = 24.5
+                sample.battery_soc = max(1.0, self.alert_manager.threshold_soc - 3.5)
                 sample.status = "descargando"
                 sample.battery_discharge_w = 1450.0
                 sample.is_critical = True

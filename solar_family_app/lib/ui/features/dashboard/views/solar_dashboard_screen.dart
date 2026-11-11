@@ -17,6 +17,7 @@ class SolarDashboardScreen extends StatelessWidget {
       builder: (context, _) {
         final reading = viewModel.currentReading;
         final criticalAlert = viewModel.activeCriticalAlert;
+        final threshold = viewModel.criticalSocThreshold;
 
         return Scaffold(
           backgroundColor: const Color(0xFF0B101B),
@@ -45,10 +46,11 @@ class SolarDashboardScreen extends StatelessWidget {
             ),
             actions: [
               IconButton(
-                tooltip: 'Probar Alerta Crítica (<30%)',
+                tooltip:
+                    'Probar Notificación (<${threshold.toStringAsFixed(0)}%)',
                 icon: const Icon(
-                  Icons.notification_important_rounded,
-                  color: Color(0xFFFF5252),
+                  Icons.notifications_none_rounded,
+                  color: Color(0xFFFFB300),
                 ),
                 onPressed: viewModel.triggerTestCriticalAlert,
               ),
@@ -62,13 +64,13 @@ class SolarDashboardScreen extends StatelessWidget {
           body: SafeArea(
             child: Column(
               children: [
-                // Banner de Alerta Crítica (< 30%) con botón para silenciar llamada sonora
+                // Banner discreto de aviso cuando la batería está bajo el umbral
                 if (criticalAlert != null)
-                  _buildCriticalEmergencyBanner(criticalAlert),
+                  _buildSimpleAlertBanner(criticalAlert, threshold),
 
                 // Barra previa de la Notificación Permanente (espejo de barra de estado)
                 if (reading != null)
-                  _buildPersistentNotificationPreviewBar(reading),
+                  _buildPersistentNotificationPreviewBar(reading, threshold),
 
                 Expanded(
                   child: SingleChildScrollView(
@@ -77,7 +79,9 @@ class SolarDashboardScreen extends StatelessWidget {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         if (reading != null) ...[
-                          _buildPrimaryTelemetryGrid(reading),
+                          _buildPrimaryTelemetryGrid(reading, threshold),
+                          const SizedBox(height: 12),
+                          _buildThresholdSetpointCard(threshold),
                           const SizedBox(height: 20),
                         ],
 
@@ -104,7 +108,7 @@ class SolarDashboardScreen extends StatelessWidget {
                         InteractiveSolarChart(
                           title: '1. Nivel de Batería - Últimas 24 Horas',
                           subtitle:
-                              'Evolución histórica del SOC (%) y umbral crítico del 30%',
+                              'Evolución histórica del SOC (%) y umbral configurado en ${threshold.toStringAsFixed(0)}%',
                           unit: '%',
                           readings: viewModel.history24h,
                           valueSelector: (r) => r.batterySoc,
@@ -112,8 +116,9 @@ class SolarDashboardScreen extends StatelessWidget {
                           gradientColor: const Color(0xFF00C853),
                           minY: 0,
                           maxY: 100,
-                          thresholdY: 30.0,
-                          thresholdLabel: 'Alerta Crítica 30%',
+                          thresholdY: threshold,
+                          thresholdLabel:
+                              'Umbral ${threshold.toStringAsFixed(0)}%',
                           showSecondsInTooltip: false,
                         ),
 
@@ -222,17 +227,25 @@ class SolarDashboardScreen extends StatelessWidget {
     );
   }
 
-  Widget _buildCriticalEmergencyBanner(SolarReading alertReading) {
+  Widget _buildSimpleAlertBanner(SolarReading alertReading, double threshold) {
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-      color: const Color(0xFFD50000),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      decoration: BoxDecoration(
+        color: const Color(0xFF2C221E),
+        border: Border(
+          bottom: BorderSide(
+            color: const Color(0xFFFFB300).withOpacity(0.5),
+            width: 1,
+          ),
+        ),
+      ),
       child: Row(
         children: [
           const Icon(
-            Icons.ring_volume_rounded,
-            color: Colors.white,
-            size: 28,
+            Icons.notifications_active_outlined,
+            color: Color(0xFFFFB300),
+            size: 22,
           ),
           const SizedBox(width: 12),
           Expanded(
@@ -240,32 +253,30 @@ class SolarDashboardScreen extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  '🚨 ¡ALERTA CRÍTICA: BATERÍA AL ${alertReading.batterySoc.toStringAsFixed(1)}%!',
+                  'Aviso: Batería en ${alertReading.batterySoc.toStringAsFixed(1)}% (Umbral: ${threshold.toStringAsFixed(0)}%)',
                   style: const TextStyle(
                     color: Colors.white,
-                    fontWeight: FontWeight.w900,
-                    fontSize: 14,
+                    fontWeight: FontWeight.w700,
+                    fontSize: 13,
                   ),
                 ),
                 Text(
-                  'Voltaje: ${alertReading.batteryVoltage.toStringAsFixed(1)}V • Descarga: ${alertReading.batteryDischargeW.toStringAsFixed(0)}W',
+                  'Voltaje: ${alertReading.batteryVoltage.toStringAsFixed(1)}V • Consumo: ${alertReading.loadPowerW.toStringAsFixed(0)}W',
                   style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 12,
+                    color: Colors.white70,
+                    fontSize: 11,
                   ),
                 ),
               ],
             ),
           ),
-          ElevatedButton.icon(
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.white,
-              foregroundColor: const Color(0xFFD50000),
+          TextButton(
+            style: TextButton.styleFrom(
+              foregroundColor: const Color(0xFFFFB300),
             ),
             onPressed: viewModel.silenceCriticalAlert,
-            icon: const Icon(Icons.volume_off_rounded, size: 18),
-            label: const Text(
-              'SILENCIAR',
+            child: const Text(
+              'OK',
               style: TextStyle(fontWeight: FontWeight.bold),
             ),
           ),
@@ -274,8 +285,11 @@ class SolarDashboardScreen extends StatelessWidget {
     );
   }
 
-  Widget _buildPersistentNotificationPreviewBar(SolarReading reading) {
-    final isGreen = reading.isHealthyGreen;
+  Widget _buildPersistentNotificationPreviewBar(
+    SolarReading reading,
+    double threshold,
+  ) {
+    final isGreen = reading.isHealthyForThreshold(threshold);
     final indicatorColor =
         isGreen ? const Color(0xFF00E676) : const Color(0xFFFF1744);
 
@@ -290,7 +304,6 @@ class SolarDashboardScreen extends StatelessWidget {
       ),
       child: Row(
         children: [
-          // Indicador visual circular exigido: Verde si carga/está bien, Rojo si descarga/bajo
           Container(
             width: 14,
             height: 14,
@@ -315,10 +328,13 @@ class SolarDashboardScreen extends StatelessWidget {
                 fontSize: 12,
                 fontWeight: FontWeight.w600,
               ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
             ),
           ),
+          const SizedBox(width: 8),
           Text(
-            reading.isHealthyGreen ? 'ÓPTIMO' : 'ATENCIÓN',
+            isGreen ? 'ÓPTIMO' : 'ATENCIÓN',
             style: TextStyle(
               color: indicatorColor,
               fontSize: 11,
@@ -330,66 +346,77 @@ class SolarDashboardScreen extends StatelessWidget {
     );
   }
 
-  Widget _buildPrimaryTelemetryGrid(SolarReading reading) {
-    final isGreen = reading.isHealthyGreen;
+  Widget _buildPrimaryTelemetryGrid(SolarReading reading, double threshold) {
+    final isGreen = reading.isHealthyForThreshold(threshold);
     final statusColor =
         isGreen ? const Color(0xFF00E676) : const Color(0xFFFF5252);
 
+    // Formatear fuente para que sea limpia y concisa
+    final cleanSource = reading.sourceMode.contains('Casa_Falla')
+        ? 'SmartESS (Casa_Falla)'
+        : reading.sourceMode;
+
     return Column(
       children: [
-        Row(
-          children: [
-            Expanded(
-              child: _buildMetricCard(
-                title: 'BATERÍA (SOC)',
-                value: '${reading.batterySoc.toStringAsFixed(1)}%',
-                subtitle:
-                    'Voltaje: ${reading.batteryVoltage.toStringAsFixed(2)} V',
-                icon: Icons.battery_charging_full_rounded,
-                accentColor: statusColor,
+        IntrinsicHeight(
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Expanded(
+                child: _buildMetricCard(
+                  title: 'BATERÍA (SOC)',
+                  value: '${reading.batterySoc.toStringAsFixed(1)}%',
+                  subtitle:
+                      'Voltaje: ${reading.batteryVoltage.toStringAsFixed(2)} V',
+                  icon: Icons.battery_charging_full_rounded,
+                  accentColor: statusColor,
+                ),
               ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: _buildMetricCard(
-                title: 'PANELES SOLARES',
-                value: '${reading.pvPowerW.toStringAsFixed(0)} W',
-                subtitle: 'Generación PV actual',
-                icon: Icons.solar_power_rounded,
-                accentColor: const Color(0xFFFFB300),
+              const SizedBox(width: 12),
+              Expanded(
+                child: _buildMetricCard(
+                  title: 'PANELES SOLARES',
+                  value: '${reading.pvPowerW.toStringAsFixed(0)} W',
+                  subtitle: 'Generación PV actual',
+                  icon: Icons.solar_power_rounded,
+                  accentColor: const Color(0xFFFFB300),
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
         const SizedBox(height: 12),
-        Row(
-          children: [
-            Expanded(
-              child: _buildMetricCard(
-                title: 'FLUJO DE BATERÍA',
-                value: reading.status == SolarSystemStatus.charging
-                    ? '+${reading.batteryChargeW.toStringAsFixed(0)} W'
-                    : reading.status == SolarSystemStatus.discharging
-                        ? '-${reading.batteryDischargeW.toStringAsFixed(0)} W'
-                        : '0 W',
-                subtitle: 'Estado: ${reading.status.displayName}',
-                icon: reading.status == SolarSystemStatus.charging
-                    ? Icons.trending_up_rounded
-                    : Icons.trending_down_rounded,
-                accentColor: statusColor,
+        IntrinsicHeight(
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Expanded(
+                child: _buildMetricCard(
+                  title: 'FLUJO DE BATERÍA',
+                  value: reading.status == SolarSystemStatus.charging
+                      ? '+${reading.batteryChargeW.toStringAsFixed(0)} W'
+                      : reading.status == SolarSystemStatus.discharging
+                          ? '-${reading.batteryDischargeW.toStringAsFixed(0)} W'
+                          : '0 W',
+                  subtitle: 'Estado: ${reading.status.displayName}',
+                  icon: reading.status == SolarSystemStatus.charging
+                      ? Icons.trending_up_rounded
+                      : Icons.trending_down_rounded,
+                  accentColor: statusColor,
+                ),
               ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: _buildMetricCard(
-                title: 'CONSUMO HOGAR',
-                value: '${reading.loadPowerW.toStringAsFixed(0)} W',
-                subtitle: 'Fuente: ${reading.sourceMode}',
-                icon: Icons.home_rounded,
-                accentColor: const Color(0xFF40C4FF),
+              const SizedBox(width: 12),
+              Expanded(
+                child: _buildMetricCard(
+                  title: 'CONSUMO HOGAR',
+                  value: '${reading.loadPowerW.toStringAsFixed(0)} W',
+                  subtitle: 'Fuente: $cleanSource',
+                  icon: Icons.home_rounded,
+                  accentColor: const Color(0xFF40C4FF),
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ],
     );
@@ -403,7 +430,8 @@ class SolarDashboardScreen extends StatelessWidget {
     required Color accentColor,
   }) {
     return Container(
-      padding: const EdgeInsets.all(16),
+      height: 112,
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
       decoration: BoxDecoration(
         color: const Color(0xFF161F30),
         borderRadius: BorderRadius.circular(18),
@@ -411,14 +439,17 @@ class SolarDashboardScreen extends StatelessWidget {
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
           Row(
             children: [
-              Icon(icon, color: accentColor, size: 20),
+              Icon(icon, color: accentColor, size: 19),
               const SizedBox(width: 6),
               Expanded(
                 child: Text(
                   title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                   style: const TextStyle(
                     color: Colors.white60,
                     fontSize: 11,
@@ -428,24 +459,146 @@ class SolarDashboardScreen extends StatelessWidget {
               ),
             ],
           ),
-          const SizedBox(height: 10),
-          Text(
-            value,
-            style: TextStyle(
-              color: accentColor,
-              fontSize: 26,
-              fontWeight: FontWeight.w900,
+          FittedBox(
+            fit: BoxFit.scaleDown,
+            alignment: Alignment.centerLeft,
+            child: Text(
+              value,
+              maxLines: 1,
+              style: TextStyle(
+                color: accentColor,
+                fontSize: 25,
+                fontWeight: FontWeight.w900,
+              ),
             ),
           ),
-          const SizedBox(height: 4),
           Text(
             subtitle,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
             style: const TextStyle(
               color: Colors.white70,
               fontSize: 12,
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildThresholdSetpointCard(double threshold) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(
+        color: const Color(0xFF161F30),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Colors.white12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(
+                Icons.tune_rounded,
+                color: Color(0xFFFFB300),
+                size: 18,
+              ),
+              const SizedBox(width: 8),
+              const Expanded(
+                child: Text(
+                  'UMBRAL DE AVISO DE BATERÍA (SETPOINT)',
+                  style: TextStyle(
+                    color: Colors.white70,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              _buildSetpointStepButton(
+                label: '-5%',
+                onTap: () => viewModel.updateCriticalThreshold(
+                  (threshold - 5).clamp(5.0, 95.0),
+                ),
+              ),
+              const SizedBox(width: 6),
+              _buildSetpointStepButton(
+                label: '-1%',
+                onTap: () => viewModel.updateCriticalThreshold(
+                  (threshold - 1).clamp(5.0, 95.0),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+                child: Text(
+                  '${threshold.toStringAsFixed(0)}%',
+                  style: const TextStyle(
+                    color: Color(0xFFFFB300),
+                    fontSize: 16,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+              ),
+              _buildSetpointStepButton(
+                label: '+1%',
+                onTap: () => viewModel.updateCriticalThreshold(
+                  (threshold + 1).clamp(5.0, 95.0),
+                ),
+              ),
+              const SizedBox(width: 6),
+              _buildSetpointStepButton(
+                label: '+5%',
+                onTap: () => viewModel.updateCriticalThreshold(
+                  (threshold + 5).clamp(5.0, 95.0),
+                ),
+              ),
+            ],
+          ),
+          SliderTheme(
+            data: SliderThemeData(
+              trackHeight: 4,
+              activeTrackColor: const Color(0xFFFFB300),
+              inactiveTrackColor: Colors.white12,
+              thumbColor: const Color(0xFFFFB300),
+              overlayColor: const Color(0xFFFFB300).withOpacity(0.15),
+            ),
+            child: Slider(
+              value: threshold.clamp(5.0, 95.0),
+              min: 5.0,
+              max: 95.0,
+              divisions: 90,
+              label: '${threshold.toStringAsFixed(0)}%',
+              onChanged: (val) =>
+                  viewModel.updateCriticalThreshold(val.roundToDouble()),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSetpointStepButton({
+    required String label,
+    required VoidCallback onTap,
+  }) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(8),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        decoration: BoxDecoration(
+          color: Colors.white.withOpacity(0.08),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: Colors.white24),
+        ),
+        child: Text(
+          label,
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 11,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
       ),
     );
   }
@@ -457,6 +610,7 @@ class SolarDashboardScreen extends StatelessWidget {
     final tgTokenCtrl = TextEditingController(text: viewModel.telegramBotToken);
     final tgChatCtrl = TextEditingController(text: viewModel.telegramChatId);
     bool demoMode = viewModel.demoMode;
+    double threshold = viewModel.criticalSocThreshold;
 
     showModalBottomSheet(
       context: context,
@@ -481,7 +635,7 @@ class SolarDashboardScreen extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     const Text(
-                      'Configuración de Red Local y Alertas',
+                      'Configuración de Red Local y Avisos',
                       style: TextStyle(
                         color: Colors.white,
                         fontSize: 18,
@@ -489,6 +643,34 @@ class SolarDashboardScreen extends StatelessWidget {
                       ),
                     ),
                     const SizedBox(height: 14),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text(
+                          'Umbral de aviso de batería (Setpoint):',
+                          style: TextStyle(color: Colors.white, fontSize: 14),
+                        ),
+                        Text(
+                          '${threshold.toStringAsFixed(0)}%',
+                          style: const TextStyle(
+                            color: Color(0xFFFFB300),
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
+                    ),
+                    Slider(
+                      value: threshold.clamp(5.0, 95.0),
+                      min: 5.0,
+                      max: 95.0,
+                      divisions: 90,
+                      activeColor: const Color(0xFFFFB300),
+                      label: '${threshold.toStringAsFixed(0)}%',
+                      onChanged: (val) =>
+                          setSheetState(() => threshold = val.roundToDouble()),
+                    ),
+                    const Divider(color: Colors.white12),
                     SwitchListTile(
                       contentPadding: EdgeInsets.zero,
                       title: const Text(
@@ -496,7 +678,7 @@ class SolarDashboardScreen extends StatelessWidget {
                         style: TextStyle(color: Colors.white, fontSize: 14),
                       ),
                       subtitle: const Text(
-                        'Útil para probar gráficas y alertas cuando estás fuera de casa',
+                        'Útil para probar gráficas y avisos cuando estás fuera de casa',
                         style: TextStyle(color: Colors.white54, fontSize: 12),
                       ),
                       value: demoMode,
@@ -509,7 +691,7 @@ class SolarDashboardScreen extends StatelessWidget {
                       style: const TextStyle(color: Colors.white),
                       decoration: const InputDecoration(
                         labelText: 'IP Local de la MacBook (Mosquitto MQTT)',
-                        hintText: 'Ej: 192.168.1.100',
+                        hintText: 'Ej: 192.168.0.224',
                         labelStyle: TextStyle(color: Colors.white70),
                       ),
                     ),
@@ -525,9 +707,9 @@ class SolarDashboardScreen extends StatelessWidget {
                       ),
                     ),
                     const SizedBox(height: 16),
-                    const Text(
-                      'Alerta Crítica Directa por Telegram (<30% Batería)',
-                      style: TextStyle(
+                    Text(
+                      'Aviso por Telegram (<${threshold.toStringAsFixed(0)}% Batería)',
+                      style: const TextStyle(
                         color: Colors.amber,
                         fontSize: 13,
                         fontWeight: FontWeight.w700,
@@ -566,6 +748,7 @@ class SolarDashboardScreen extends StatelessWidget {
                             telegramToken: tgTokenCtrl.text,
                             telegramChatId: tgChatCtrl.text,
                             demoMode: demoMode,
+                            criticalThreshold: threshold,
                           );
                           Navigator.of(ctx).pop();
                         },

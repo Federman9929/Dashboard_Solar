@@ -26,12 +26,14 @@ class SolarRepository {
   static const String _prefTelegramToken = 'telegram_bot_token';
   static const String _prefTelegramChatId = 'telegram_chat_id';
   static const String _prefDemoMode = 'demo_mode_enabled';
+  static const String _prefCriticalThreshold = 'critical_soc_threshold';
 
-  String _brokerHost = '10.0.2.2';
+  String _brokerHost = '192.168.0.224';
   int _brokerPort = 1883;
   String _telegramBotToken = '';
   String _telegramChatId = '';
   bool _demoMode = false;
+  double _criticalSocThreshold = 30.0;
   Timer? _demoTimer;
 
   String get brokerHost => _brokerHost;
@@ -39,6 +41,7 @@ class SolarRepository {
   String get telegramBotToken => _telegramBotToken;
   String get telegramChatId => _telegramChatId;
   bool get demoMode => _demoMode;
+  double get criticalSocThreshold => _criticalSocThreshold;
 
   Stream<MqttConnectionStateStatus> get connectionStream =>
       _mqttService.connectionStream;
@@ -79,11 +82,12 @@ class SolarRepository {
     unawaited(_notificationService.initialize());
 
     final prefs = await SharedPreferences.getInstance();
-    _brokerHost = prefs.getString(_prefBrokerHost) ?? '10.0.2.2';
+    _brokerHost = prefs.getString(_prefBrokerHost) ?? '192.168.0.224';
     _brokerPort = prefs.getInt(_prefBrokerPort) ?? 1883;
     _telegramBotToken = prefs.getString(_prefTelegramToken) ?? '';
     _telegramChatId = prefs.getString(_prefTelegramChatId) ?? '';
     _demoMode = prefs.getBool(_prefDemoMode) ?? false;
+    _criticalSocThreshold = prefs.getDouble(_prefCriticalThreshold) ?? 30.0;
 
     // Escuchar telemetría MQTT en tiempo real (cada 1-2s)
     _mqttService.telemetryStream.listen((jsonMap) {
@@ -158,11 +162,16 @@ class SolarRepository {
     _realtimeWindowController.add(List.unmodifiable(_realtimeReadings));
 
     // 3. Actualizar Notificación Permanente en la barra de estado
-    _notificationService.updatePersistentNotification(reading);
+    _notificationService.updatePersistentNotification(
+      reading,
+      threshold: _criticalSocThreshold,
+    );
 
-    // 4. Evaluar umbral crítico (< 30%)
-    if (reading.batterySoc < 30.0 || reading.isCritical) {
+    // 4. Evaluar umbral crítico configurable por el usuario
+    if (reading.batterySoc < _criticalSocThreshold) {
       _triggerCriticalAlertFlow(reading);
+    } else {
+      _criticalAlertBannerController.add(null);
     }
   }
 
@@ -170,6 +179,7 @@ class SolarRepository {
     _criticalAlertBannerController.add(reading);
     _notificationService.triggerCriticalBatteryAlert(
       reading: reading,
+      threshold: _criticalSocThreshold,
       telegramBotToken: _telegramBotToken,
       telegramChatId: _telegramChatId,
       force: force,
@@ -182,11 +192,12 @@ class SolarRepository {
   }
 
   Future<void> simulateCriticalAlertTest() async {
+    final testSoc = (_criticalSocThreshold - 3.5).clamp(1.0, 99.0);
     final fakeCritical = SolarReading(
       timestamp: DateTime.now(),
       epochMs: DateTime.now().millisecondsSinceEpoch,
       batteryVoltage: 45.8,
-      batterySoc: 26.4,
+      batterySoc: double.parse(testSoc.toStringAsFixed(1)),
       pvPowerW: 45.0,
       batteryPowerW: -1350.0,
       batteryChargeW: 0.0,
@@ -201,18 +212,45 @@ class SolarRepository {
     _mqttService.sendCommand('TEST_CRITICAL_ALERT');
   }
 
+  Future<void> updateCriticalThreshold(double newThreshold) async {
+    _criticalSocThreshold = newThreshold.clamp(5.0, 95.0);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_prefCriticalThreshold, _criticalSocThreshold);
+
+    _mqttService.sendCommand(
+      'SET_THRESHOLD:${_criticalSocThreshold.toStringAsFixed(1)}',
+    );
+
+    if (_realtimeReadings.isNotEmpty) {
+      final latest = _realtimeReadings.last;
+      _notificationService.updatePersistentNotification(
+        latest,
+        threshold: _criticalSocThreshold,
+      );
+      if (latest.batterySoc < _criticalSocThreshold) {
+        _triggerCriticalAlertFlow(latest, force: true);
+      } else {
+        await silenceCriticalAlert();
+      }
+    }
+  }
+
   Future<void> updateSettings({
     required String host,
     required int port,
     required String telegramToken,
     required String telegramChatId,
     required bool demoMode,
+    double? criticalThreshold,
   }) async {
     _brokerHost = host.trim();
     _brokerPort = port;
     _telegramBotToken = telegramToken.trim();
     _telegramChatId = telegramChatId.trim();
     _demoMode = demoMode;
+    if (criticalThreshold != null) {
+      _criticalSocThreshold = criticalThreshold.clamp(5.0, 95.0);
+    }
 
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_prefBrokerHost, _brokerHost);
@@ -220,6 +258,11 @@ class SolarRepository {
     await prefs.setString(_prefTelegramToken, _telegramBotToken);
     await prefs.setString(_prefTelegramChatId, _telegramChatId);
     await prefs.setBool(_prefDemoMode, _demoMode);
+    await prefs.setDouble(_prefCriticalThreshold, _criticalSocThreshold);
+
+    _mqttService.sendCommand(
+      'SET_THRESHOLD:${_criticalSocThreshold.toStringAsFixed(1)}',
+    );
 
     _demoTimer?.cancel();
     if (_demoMode) {

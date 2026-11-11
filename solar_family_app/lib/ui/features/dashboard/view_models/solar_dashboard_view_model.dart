@@ -32,6 +32,7 @@ class SolarDashboardViewModel extends ChangeNotifier {
   String get telegramBotToken => _repository.telegramBotToken;
   String get telegramChatId => _repository.telegramChatId;
   bool get demoMode => _repository.demoMode;
+  double get criticalSocThreshold => _repository.criticalSocThreshold;
 
   final List<StreamSubscription<dynamic>> _subscriptions = [];
 
@@ -88,12 +89,18 @@ class SolarDashboardViewModel extends ChangeNotifier {
     await _repository.simulateCriticalAlertTest();
   }
 
+  Future<void> updateCriticalThreshold(double newThreshold) async {
+    await _repository.updateCriticalThreshold(newThreshold);
+    notifyListeners();
+  }
+
   Future<void> saveSettings({
     required String host,
     required int port,
     required String telegramToken,
     required String telegramChatId,
     required bool demoMode,
+    double? criticalThreshold,
   }) async {
     await _repository.updateSettings(
       host: host,
@@ -101,6 +108,7 @@ class SolarDashboardViewModel extends ChangeNotifier {
       telegramToken: telegramToken,
       telegramChatId: telegramChatId,
       demoMode: demoMode,
+      criticalThreshold: criticalThreshold,
     );
     notifyListeners();
   }

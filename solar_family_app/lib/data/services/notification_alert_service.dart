@@ -1,9 +1,7 @@
 import 'dart:convert';
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
-import 'package:flutter_ringtone_player/flutter_ringtone_player.dart';
 import 'package:http/http.dart' as http;
 
 import '../../domain/models/solar_reading.dart';
@@ -11,25 +9,21 @@ import '../../domain/models/solar_reading.dart';
 /// Gestiona:
 /// 1. La Notificación Permanente (Foreground / Ongoing) en la barra de estado
 ///    con el porcentaje de batería, estado actual y círculo de color (🟢/🔴).
-/// 2. La Alerta Crítica (< 30% de batería) con sirena tipo llamada entrante
-///    y envío opcional a Telegram Bot API sin costo.
+/// 2. El Aviso de Batería Baja mediante una notificación simple y discreta
+///    (sin sirenas ni alarmas prolongadas) cuando baja del umbral configurado.
 class NotificationAndAlertService {
   final FlutterLocalNotificationsPlugin _notificationsPlugin =
       FlutterLocalNotificationsPlugin();
-  final FlutterRingtonePlayer _ringtonePlayer = FlutterRingtonePlayer();
 
   static const int _ongoingNotificationId = 1001;
   static const int _criticalAlertNotificationId = 9999;
 
   static const String _ongoingChannelId = 'solar_ongoing_status_channel';
-  static const String _criticalChannelId = 'solar_critical_alarm_channel';
+  static const String _simpleAlertChannelId = 'solar_battery_notice_channel';
 
   bool _isInitialized = false;
-  bool _isRinging = false;
   DateTime? _lastOngoingUpdate;
   DateTime? _lastCriticalTrigger;
-
-  bool get isRinging => _isRinging;
 
   Future<void> initialize() async {
     if (_isInitialized) return;
@@ -40,7 +34,6 @@ class NotificationAndAlertService {
       requestAlertPermission: true,
       requestBadgePermission: true,
       requestSoundPermission: true,
-      requestCriticalPermission: true,
     );
 
     const initSettings = InitializationSettings(
@@ -49,15 +42,7 @@ class NotificationAndAlertService {
       macOS: iosSettings,
     );
 
-    await _notificationsPlugin.initialize(
-      initSettings,
-      onDidReceiveNotificationResponse: (NotificationResponse response) {
-        // Si el usuario toca la notificación de alarma crítica, silenciar el timbre
-        if (response.id == _criticalAlertNotificationId) {
-          stopCriticalAlarmSound();
-        }
-      },
-    );
+    await _notificationsPlugin.initialize(initSettings);
 
     // Solicitar permisos en Android 13+
     final androidImplementation =
@@ -70,8 +55,11 @@ class NotificationAndAlertService {
 
   /// Actualiza la Notificación Permanente (Ongoing) en la barra de estado.
   /// Incluye círculo verde (🟢) si está cargando/saludable, o rojo (🔴) si
-  /// está descargando o con batería baja.
-  Future<void> updatePersistentNotification(SolarReading reading) async {
+  /// está descargando o con batería baja según el umbral configurado.
+  Future<void> updatePersistentNotification(
+    SolarReading reading, {
+    double threshold = 30.0,
+  }) async {
     if (!_isInitialized) await initialize();
 
     // Limitar actualizaciones de barra de estado a máximo 1 cada 2 segundos
@@ -82,8 +70,8 @@ class NotificationAndAlertService {
     }
     _lastOngoingUpdate = now;
 
-    final isGreen = reading.isHealthyGreen;
-    final circleIndicator = reading.statusEmoji; // 🟢 o 🔴
+    final isGreen = reading.isHealthyForThreshold(threshold);
+    final circleIndicator = reading.statusEmojiForThreshold(threshold); // 🟢 o 🔴
     final indicatorColor =
         isGreen ? const Color(0xFF00E676) : const Color(0xFFFF1744);
 
@@ -130,10 +118,11 @@ class NotificationAndAlertService {
     );
   }
 
-  /// Dispara una Alerta Crítica tipo Llamada Entrante + Notificación FullScreen
-  /// cuando el nivel de batería baja del 30%.
+  /// Muestra una notificación simple y normal (sin alarma estridente ni bucle)
+  /// cuando el nivel de batería baja del umbral configurado por el usuario.
   Future<void> triggerCriticalBatteryAlert({
     required SolarReading reading,
+    double threshold = 30.0,
     String? telegramBotToken,
     String? telegramChatId,
     bool force = false,
@@ -141,7 +130,7 @@ class NotificationAndAlertService {
     if (!_isInitialized) await initialize();
 
     final now = DateTime.now();
-    // Cooldown de 5 minutos para no saturar una vez atendida, salvo prueba manual
+    // Cooldown de 5 minutos para no repetir notificaciones seguidas, salvo prueba manual
     if (!force &&
         _lastCriticalTrigger != null &&
         now.difference(_lastCriticalTrigger!).inMinutes < 5) {
@@ -149,25 +138,18 @@ class NotificationAndAlertService {
     }
     _lastCriticalTrigger = now;
 
-    // 1. Reproducir sonido persistente de llamada/alarma en el teléfono
-    _startCriticalAlarmSound();
-
-    // 2. Mostrar notificación crítica de máxima prioridad (tipo llamada entrante)
-    final vibrationPattern = Int64List.fromList([0, 800, 400, 800, 400, 1200]);
-    final androidDetails = AndroidNotificationDetails(
-      _criticalChannelId,
-      'Alertas Críticas de Batería (<30%)',
+    const androidDetails = AndroidNotificationDetails(
+      _simpleAlertChannelId,
+      'Avisos de Nivel de Batería',
       channelDescription:
-          'Alerta sonora tipo llamada cuando la batería solar baja del 30%',
-      importance: Importance.max,
-      priority: Priority.max,
-      fullScreenIntent: true,
-      category: AndroidNotificationCategory.call,
-      color: const Color(0xFFD50000),
-      colorized: true,
-      ongoing: true,
+          'Notificación simple cuando la batería baja del umbral configurado',
+      importance: Importance.defaultImportance,
+      priority: Priority.defaultPriority,
+      fullScreenIntent: false,
+      ongoing: false,
       autoCancel: true,
-      vibrationPattern: vibrationPattern,
+      onlyAlertOnce: true,
+      color: Color(0xFFFFB300),
       visibility: NotificationVisibility.public,
     );
 
@@ -175,17 +157,17 @@ class NotificationAndAlertService {
       presentAlert: true,
       presentBadge: true,
       presentSound: true,
-      interruptionLevel: InterruptionLevel.critical,
+      interruptionLevel: InterruptionLevel.active,
     );
 
     await _notificationsPlugin.show(
       _criticalAlertNotificationId,
-      '🚨 ¡ALERTA CRÍTICA: BATERÍA AL ${reading.batterySoc.toStringAsFixed(1)}%!',
-      'Descargando a ${reading.batteryDischargeW.toStringAsFixed(0)}W (${reading.batteryVoltage.toStringAsFixed(1)}V). Toca para silenciar la alarma.',
-      NotificationDetails(android: androidDetails, iOS: iosDetails),
+      '🔋 Batería en ${reading.batterySoc.toStringAsFixed(1)}% (Umbral: ${threshold.toStringAsFixed(0)}%)',
+      'Nivel por debajo del ajuste (${threshold.toStringAsFixed(0)}%). Voltaje: ${reading.batteryVoltage.toStringAsFixed(1)}V • Consumo: ${reading.loadPowerW.toStringAsFixed(0)}W.',
+      const NotificationDetails(android: androidDetails, iOS: iosDetails),
     );
 
-    // 3. Si el usuario configuró credenciales de Telegram en la App, enviar mensaje directo
+    // Si el usuario configuró credenciales de Telegram en la App, enviar mensaje directo
     if (telegramBotToken != null &&
         telegramBotToken.isNotEmpty &&
         telegramChatId != null &&
@@ -194,32 +176,16 @@ class NotificationAndAlertService {
         botToken: telegramBotToken,
         chatId: telegramChatId,
         reading: reading,
+        threshold: threshold,
       );
-    }
-  }
-
-  void _startCriticalAlarmSound() {
-    try {
-      _isRinging = true;
-      _ringtonePlayer.play(
-        android: AndroidSounds.alarm,
-        ios: IosSounds.alarm,
-        looping: true,
-        volume: 1.0,
-        asAlarm: true,
-      );
-    } catch (e) {
-      debugPrint('No se pudo reproducir el tono de llamada crítica: $e');
     }
   }
 
   Future<void> stopCriticalAlarmSound() async {
     try {
-      _isRinging = false;
-      await _ringtonePlayer.stop();
       await _notificationsPlugin.cancel(_criticalAlertNotificationId);
     } catch (e) {
-      debugPrint('Error al detener alarma: $e');
+      debugPrint('Error al cerrar notificación: $e');
     }
   }
 
@@ -227,14 +193,16 @@ class NotificationAndAlertService {
     required String botToken,
     required String chatId,
     required SolarReading reading,
+    required double threshold,
   }) async {
     try {
       final uri =
           Uri.parse('https://api.telegram.org/bot$botToken/sendMessage');
-      final message = '🚨 *ALERTA SOLAR FAMILIAR (<30%)* 🚨\n'
-          '🔴 Batería crítica: *${reading.batterySoc.toStringAsFixed(1)}%* (${reading.batteryVoltage.toStringAsFixed(1)}V)\n'
-          '⚡ Descarga actual: *${reading.batteryDischargeW.toStringAsFixed(0)} W*\n'
-          '☀️ Paneles solares: *${reading.pvPowerW.toStringAsFixed(0)} W*';
+      final message =
+          '🔋 *AVISO SOLAR FAMILIAR (<${threshold.toStringAsFixed(0)}%)*\n'
+          '• Batería actual: *${reading.batterySoc.toStringAsFixed(1)}%* (${reading.batteryVoltage.toStringAsFixed(1)}V)\n'
+          '• Descarga actual: *${reading.batteryDischargeW.toStringAsFixed(0)} W*\n'
+          '• Paneles solares: *${reading.pvPowerW.toStringAsFixed(0)} W*';
 
       await http
           .post(
@@ -248,7 +216,7 @@ class NotificationAndAlertService {
           )
           .timeout(const Duration(seconds: 5));
     } catch (e) {
-      debugPrint('Error enviando alerta a Telegram desde app: $e');
+      debugPrint('Error enviando alerta directa a Telegram: $e');
     }
   }
 }
