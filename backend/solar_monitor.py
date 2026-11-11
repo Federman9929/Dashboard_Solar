@@ -354,14 +354,18 @@ class InverterReader:
         load_w = float(data.get("load_power_w", 0.0))
         batt_w = float(data.get("battery_power_w", 0.0))
         soc = float(data.get("battery_soc", 0.0))
-        inverter_v = float(data.get("inverter_voltage", 240.0))
-        work_state = data.get("work_state", "Normal")
+        batt_v = float(data.get("battery_voltage", 0.0))
 
         # Si el inversor reporta SOC 0% por ser baterías de plomo-ácido o sin BMS CAN,
-        # estimar el SOC a partir de la curva de voltaje de 48V
+        # estimar el SOC a partir de la curva de voltaje de 48V o potencias
         if soc <= 0.0:
-            # Estimar SOC a partir de estado y potencias
-            soc = 75.0 if batt_w >= 0 else 60.0
+            if batt_v > 40.0:
+                soc = self._estimate_soc_from_voltage(batt_v)
+            else:
+                soc = 75.0 if batt_w >= 0 else 60.0
+
+        if batt_v <= 0.0:
+            batt_v = round(48.0 + (soc / 100.0) * 6.5, 2)
 
         charge_w = max(0.0, batt_w)
         discharge_w = max(0.0, -batt_w)
@@ -380,7 +384,7 @@ class InverterReader:
         return SolarTelemetry(
             timestamp=now.isoformat(),
             epoch_ms=int(now.timestamp() * 1000),
-            battery_voltage=round(48.0 + (soc / 100.0) * 6.5, 2),
+            battery_voltage=round(batt_v, 2),
             battery_soc=round(soc, 1),
             pv_power_w=round(pv_w, 1),
             battery_power_w=round(batt_w, 1),

@@ -31,7 +31,7 @@ class SolarRepository {
   int _brokerPort = 1883;
   String _telegramBotToken = '';
   String _telegramChatId = '';
-  bool _demoMode = true;
+  bool _demoMode = false;
   Timer? _demoTimer;
 
   String get brokerHost => _brokerHost;
@@ -74,7 +74,7 @@ class SolarRepository {
     _brokerPort = prefs.getInt(_prefBrokerPort) ?? 1883;
     _telegramBotToken = prefs.getString(_prefTelegramToken) ?? '';
     _telegramChatId = prefs.getString(_prefTelegramChatId) ?? '';
-    _demoMode = prefs.getBool(_prefDemoMode) ?? true;
+    _demoMode = prefs.getBool(_prefDemoMode) ?? false;
 
     // Pre-cargar curva inicial de 24h por si aún no responde la red local
     _seedInitialHistoryIfNeeded();
