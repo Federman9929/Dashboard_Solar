@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -23,9 +25,11 @@ Future<void> main() async {
   );
   final dashboardViewModel = SolarDashboardViewModel(repository: repository);
 
-  await dashboardViewModel.init();
-
+  // Iniciar la interfaz gráfica inmediatamente sin bloquear la pantalla de arranque
   runApp(SolarFamilyApp(viewModel: dashboardViewModel));
+
+  // Inicializar notificaciones y conexión MQTT en segundo plano
+  unawaited(dashboardViewModel.init());
 }
 
 class SolarFamilyApp extends StatelessWidget {

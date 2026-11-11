@@ -36,14 +36,6 @@ class SolarDashboardViewModel extends ChangeNotifier {
   final List<StreamSubscription<dynamic>> _subscriptions = [];
 
   Future<void> init() async {
-    await _repository.initialize();
-    _history24h = _repository.history24h;
-    _realtimeReadings = _repository.realtimeReadings;
-    if (_realtimeReadings.isNotEmpty) {
-      _currentReading = _realtimeReadings.last;
-    }
-    notifyListeners();
-
     _subscriptions.add(
       _repository.readingStream.listen((reading) {
         _currentReading = reading;
@@ -78,6 +70,14 @@ class SolarDashboardViewModel extends ChangeNotifier {
         notifyListeners();
       }),
     );
+
+    await _repository.initialize();
+    _history24h = _repository.history24h;
+    _realtimeReadings = _repository.realtimeReadings;
+    if (_realtimeReadings.isNotEmpty) {
+      _currentReading = _realtimeReadings.last;
+    }
+    notifyListeners();
   }
 
   Future<void> silenceCriticalAlert() async {

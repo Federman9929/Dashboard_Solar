@@ -67,7 +67,16 @@ class SolarRepository {
       List.unmodifiable(_realtimeReadings);
 
   Future<void> initialize() async {
-    await _notificationService.initialize();
+    // Pre-cargar curva inicial de 24h de inmediato para renderizar las gráficas al instante
+    _seedInitialHistoryIfNeeded();
+    _history24hController.add(List.unmodifiable(_history24h));
+    _realtimeWindowController.add(List.unmodifiable(_realtimeReadings));
+    if (_realtimeReadings.isNotEmpty) {
+      _readingStreamController.add(_realtimeReadings.last);
+    }
+
+    // Inicializar notificaciones sin bloquear si el usuario tarda en aceptar el diálogo de permisos
+    unawaited(_notificationService.initialize());
 
     final prefs = await SharedPreferences.getInstance();
     _brokerHost = prefs.getString(_prefBrokerHost) ?? '10.0.2.2';
@@ -75,9 +84,6 @@ class SolarRepository {
     _telegramBotToken = prefs.getString(_prefTelegramToken) ?? '';
     _telegramChatId = prefs.getString(_prefTelegramChatId) ?? '';
     _demoMode = prefs.getBool(_prefDemoMode) ?? false;
-
-    // Pre-cargar curva inicial de 24h por si aún no responde la red local
-    _seedInitialHistoryIfNeeded();
 
     // Escuchar telemetría MQTT en tiempo real (cada 1-2s)
     _mqttService.telemetryStream.listen((jsonMap) {
