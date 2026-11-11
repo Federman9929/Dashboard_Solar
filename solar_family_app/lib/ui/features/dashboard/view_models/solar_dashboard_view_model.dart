@@ -27,6 +27,15 @@ class SolarDashboardViewModel extends ChangeNotifier {
       MqttConnectionStateStatus.disconnected;
   MqttConnectionStateStatus get connectionStatus => _connectionStatus;
 
+  MqttDiagnosticsSnapshot? _diagnostics;
+  MqttDiagnosticsSnapshot get diagnostics =>
+      _diagnostics ?? _repository.currentDiagnostics;
+
+  /// Índice de la gráfica activa en el selector inferior de solo íconos:
+  /// 0 = Batería (SOC 24h), 1 = Paneles Solares PV (W), 2 = Carga de la Casa (W)
+  int _selectedChartIndex = 0;
+  int get selectedChartIndex => _selectedChartIndex;
+
   String get brokerHost => _repository.brokerHost;
   int get brokerPort => _repository.brokerPort;
   String get telegramBotToken => _repository.telegramBotToken;
@@ -37,6 +46,14 @@ class SolarDashboardViewModel extends ChangeNotifier {
   final List<StreamSubscription<dynamic>> _subscriptions = [];
 
   Future<void> init() async {
+    // 1. Actualizar lista de ventana en tiempo real sin doble notifyListeners()
+    _subscriptions.add(
+      _repository.realtimeWindowStream.listen((realtime) {
+        _realtimeReadings = realtime;
+      }),
+    );
+
+    // 2. Un único notifyListeners() por cada segundo de lectura recibida
     _subscriptions.add(
       _repository.readingStream.listen((reading) {
         _currentReading = reading;
@@ -52,15 +69,15 @@ class SolarDashboardViewModel extends ChangeNotifier {
     );
 
     _subscriptions.add(
-      _repository.realtimeWindowStream.listen((realtime) {
-        _realtimeReadings = realtime;
+      _repository.connectionStream.listen((status) {
+        _connectionStatus = status;
         notifyListeners();
       }),
     );
 
     _subscriptions.add(
-      _repository.connectionStream.listen((status) {
-        _connectionStatus = status;
+      _repository.diagnosticsStream.listen((diag) {
+        _diagnostics = diag;
         notifyListeners();
       }),
     );
@@ -75,10 +92,21 @@ class SolarDashboardViewModel extends ChangeNotifier {
     await _repository.initialize();
     _history24h = _repository.history24h;
     _realtimeReadings = _repository.realtimeReadings;
+    _diagnostics = _repository.currentDiagnostics;
     if (_realtimeReadings.isNotEmpty) {
       _currentReading = _realtimeReadings.last;
     }
     notifyListeners();
+  }
+
+  void selectChart(int index) {
+    if (_selectedChartIndex == index) return;
+    _selectedChartIndex = index.clamp(0, 2);
+    notifyListeners();
+  }
+
+  Future<void> retryConnectionNow() async {
+    await _repository.retryConnectionNow();
   }
 
   Future<void> silenceCriticalAlert() async {

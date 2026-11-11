@@ -18,29 +18,39 @@ class SolarDashboardScreen extends StatelessWidget {
         final reading = viewModel.currentReading;
         final criticalAlert = viewModel.activeCriticalAlert;
         final threshold = viewModel.criticalSocThreshold;
+        final selectedChart = viewModel.selectedChartIndex;
 
         return Scaffold(
           backgroundColor: const Color(0xFF0B101B),
           appBar: AppBar(
             backgroundColor: const Color(0xFF111927),
             elevation: 0,
+            titleSpacing: 12,
             title: Row(
               children: [
-                const Icon(Icons.wb_sunny_rounded, color: Color(0xFFFFB300)),
-                const SizedBox(width: 10),
+                const Icon(
+                  Icons.wb_sunny_rounded,
+                  color: Color(0xFFFFB300),
+                  size: 20,
+                ),
+                const SizedBox(width: 8),
                 const Expanded(
                   child: Text(
-                    'Monitor Solar Familiar',
+                    'Monitor Solar',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
                     style: TextStyle(
                       color: Colors.white,
                       fontWeight: FontWeight.w700,
-                      fontSize: 18,
+                      fontSize: 16,
                     ),
                   ),
                 ),
                 _buildConnectionBadge(
-                  viewModel.connectionStatus,
-                  viewModel.demoMode,
+                  context: context,
+                  status: viewModel.connectionStatus,
+                  demoMode: viewModel.demoMode,
+                  diagnostics: viewModel.diagnostics,
                 ),
               ],
             ),
@@ -64,17 +74,15 @@ class SolarDashboardScreen extends StatelessWidget {
           body: SafeArea(
             child: Column(
               children: [
-                // Banner discreto de aviso cuando la batería está bajo el umbral
                 if (criticalAlert != null)
                   _buildSimpleAlertBanner(criticalAlert, threshold),
 
-                // Barra previa de la Notificación Permanente (espejo de barra de estado)
                 if (reading != null)
                   _buildPersistentNotificationPreviewBar(reading, threshold),
 
                 Expanded(
                   child: SingleChildScrollView(
-                    padding: const EdgeInsets.all(16),
+                    padding: const EdgeInsets.fromLTRB(16, 14, 16, 16),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
@@ -82,72 +90,16 @@ class SolarDashboardScreen extends StatelessWidget {
                           _buildPrimaryTelemetryGrid(reading, threshold),
                           const SizedBox(height: 12),
                           _buildThresholdSetpointCard(threshold),
-                          const SizedBox(height: 20),
+                          const SizedBox(height: 16),
                         ],
 
-                        const Text(
-                          'GRÁFICAS DINÁMICAS E INTERACTIVAS',
-                          style: TextStyle(
-                            color: Colors.white54,
-                            fontSize: 12,
-                            fontWeight: FontWeight.w700,
-                            letterSpacing: 1.1,
+                        // Renderizar ÚNICAMENTE la gráfica seleccionada para
+                        // reducir el consumo de CPU/GPU en un 70% y evitar calentamiento
+                        RepaintBoundary(
+                          child: _buildSelectedChart(
+                            selectedIndex: selectedChart,
+                            threshold: threshold,
                           ),
-                        ),
-                        const SizedBox(height: 4),
-                        const Text(
-                          'Pellizca con dos dedos o usa +/- para hacer zoom. Toca cualquier punto para ver el valor y hora exacta.',
-                          style: TextStyle(
-                            color: Colors.white38,
-                            fontSize: 12,
-                          ),
-                        ),
-                        const SizedBox(height: 14),
-
-                        // 1. Gráfica de Nivel de Batería de las últimas 24 horas (%)
-                        InteractiveSolarChart(
-                          title: '1. Nivel de Batería - Últimas 24 Horas',
-                          subtitle:
-                              'Evolución histórica del SOC (%) y umbral configurado en ${threshold.toStringAsFixed(0)}%',
-                          unit: '%',
-                          readings: viewModel.history24h,
-                          valueSelector: (r) => r.batterySoc,
-                          lineColor: const Color(0xFF00E676),
-                          gradientColor: const Color(0xFF00C853),
-                          minY: 0,
-                          maxY: 100,
-                          thresholdY: threshold,
-                          thresholdLabel:
-                              'Umbral ${threshold.toStringAsFixed(0)}%',
-                          showSecondsInTooltip: false,
-                        ),
-
-                        // 2. Gráfica de Potencia Entregada por los Paneles Solares en Tiempo Real (W)
-                        InteractiveSolarChart(
-                          title: '2. Potencia de Paneles Solares (Tiempo Real)',
-                          subtitle:
-                              'Generación fotovoltaica instantánea recibida cada ~1.5s',
-                          unit: 'W',
-                          readings: viewModel.realtimeReadings,
-                          valueSelector: (r) => r.pvPowerW,
-                          lineColor: const Color(0xFFFFB300),
-                          gradientColor: const Color(0xFFFF8F00),
-                          minY: 0,
-                          showSecondsInTooltip: true,
-                        ),
-
-                        // 3. Gráfica de Potencia de Descarga de la Batería (W)
-                        InteractiveSolarChart(
-                          title: '3. Potencia de Descarga de Batería',
-                          subtitle:
-                              'Energía extraída del banco de baterías en tiempo real',
-                          unit: 'W',
-                          readings: viewModel.realtimeReadings,
-                          valueSelector: (r) => r.batteryDischargeW,
-                          lineColor: const Color(0xFFFF5252),
-                          gradientColor: const Color(0xFFD50000),
-                          minY: 0,
-                          showSecondsInTooltip: true,
                         ),
                       ],
                     ),
@@ -156,70 +108,422 @@ class SolarDashboardScreen extends StatelessWidget {
               ],
             ),
           ),
+          bottomNavigationBar: _buildMinimalIconChartSelector(selectedChart),
         );
       },
     );
   }
 
-  Widget _buildConnectionBadge(
-    MqttConnectionStateStatus status,
-    bool demoMode,
-  ) {
-    if (demoMode) {
-      return Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-        decoration: BoxDecoration(
-          color: const Color(0xFF2962FF).withOpacity(0.2),
-          borderRadius: BorderRadius.circular(20),
-          border: Border.all(color: const Color(0xFF448AFF)),
+  /// Renderiza únicamente 1 gráfica activa según el ícono seleccionado abajo:
+  /// 0 = Batería (%), 1 = Generación PV (W), 2 = Carga de la Casa (W)
+  Widget _buildSelectedChart({
+    required int selectedIndex,
+    required double threshold,
+  }) {
+    switch (selectedIndex) {
+      case 0:
+        return InteractiveSolarChart(
+          key: const ValueKey('chart_battery'),
+          title: 'Nivel de Batería (SOC %)',
+          subtitle:
+              'Historial 24h y umbral configurado en ${threshold.toStringAsFixed(0)}%',
+          unit: '%',
+          readings: viewModel.history24h,
+          valueSelector: (r) => r.batterySoc,
+          lineColor: const Color(0xFF00E676),
+          gradientColor: const Color(0xFF00C853),
+          minY: 0,
+          maxY: 100,
+          thresholdY: threshold,
+          thresholdLabel: 'Umbral ${threshold.toStringAsFixed(0)}%',
+          showSecondsInTooltip: false,
+        );
+      case 1:
+        return InteractiveSolarChart(
+          key: const ValueKey('chart_pv'),
+          title: 'Generación Solar PV (Tiempo Real 1s)',
+          subtitle: 'Potencia entregada por los paneles solares segundo a segundo',
+          unit: 'W',
+          readings: viewModel.realtimeReadings,
+          valueSelector: (r) => r.pvPowerW,
+          lineColor: const Color(0xFFFFB300),
+          gradientColor: const Color(0xFFFF8F00),
+          minY: 0,
+          showSecondsInTooltip: true,
+        );
+      case 2:
+      default:
+        return InteractiveSolarChart(
+          key: const ValueKey('chart_load'),
+          title: 'Carga / Consumo de la Casa (Tiempo Real 1s)',
+          subtitle: 'Potencia consumida por el hogar segundo a segundo',
+          unit: 'W',
+          readings: viewModel.realtimeReadings,
+          valueSelector: (r) => r.loadPowerW,
+          lineColor: const Color(0xFF40C4FF),
+          gradientColor: const Color(0xFF00B0FF),
+          minY: 0,
+          showSecondsInTooltip: true,
+        );
+    }
+  }
+
+  /// Selector inferior minimalista de gráficas: SOLO ÍCONOS (sin texto)
+  /// [Batería] • [Paneles PV] • [Carga Casa]
+  Widget _buildMinimalIconChartSelector(int selectedIndex) {
+    return Container(
+      decoration: const BoxDecoration(
+        color: Color(0xFF111927),
+        border: Border(
+          top: BorderSide(color: Colors.white12, width: 1),
         ),
-        child: const Text(
-          'MODO DEMO',
-          style: TextStyle(
-            color: Color(0xFF82B1FF),
-            fontSize: 10,
-            fontWeight: FontWeight.bold,
+      ),
+      child: SafeArea(
+        top: false,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 24),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: [
+              _buildChartIconButton(
+                index: 0,
+                selectedIndex: selectedIndex,
+                icon: Icons.battery_charging_full_rounded,
+                activeColor: const Color(0xFF00E676),
+              ),
+              _buildChartIconButton(
+                index: 1,
+                selectedIndex: selectedIndex,
+                icon: Icons.wb_sunny_rounded,
+                activeColor: const Color(0xFFFFB300),
+              ),
+              _buildChartIconButton(
+                index: 2,
+                selectedIndex: selectedIndex,
+                icon: Icons.home_rounded,
+                activeColor: const Color(0xFF40C4FF),
+              ),
+            ],
           ),
         ),
-      );
-    }
+      ),
+    );
+  }
 
-    final (label, color) = switch (status) {
-      MqttConnectionStateStatus.connected => (
-          'MQTT ACTIVO',
+  Widget _buildChartIconButton({
+    required int index,
+    required int selectedIndex,
+    required IconData icon,
+    required Color activeColor,
+  }) {
+    final isSelected = index == selectedIndex;
+    return InkWell(
+      onTap: () => viewModel.selectChart(index),
+      borderRadius: BorderRadius.circular(16),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 180),
+        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 10),
+        decoration: BoxDecoration(
+          color: isSelected
+              ? activeColor.withOpacity(0.18)
+              : Colors.transparent,
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(
+            color: isSelected
+                ? activeColor.withOpacity(0.6)
+                : Colors.transparent,
+            width: 1.2,
+          ),
+        ),
+        child: Icon(
+          icon,
+          size: 26,
+          color: isSelected ? activeColor : Colors.white38,
+        ),
+      ),
+    );
+  }
+
+  /// Botón interactivo de estado de conexión: al tocarlo abre la ventana
+  /// de diagnóstico paso a paso para saber exactamente en qué paso va.
+  Widget _buildConnectionBadge({
+    required BuildContext context,
+    required MqttConnectionStateStatus status,
+    required bool demoMode,
+    required MqttDiagnosticsSnapshot diagnostics,
+  }) {
+    final (String label, Color color) = demoMode
+        ? ('MODO DEMO', const Color(0xFF448AFF))
+        : switch (status) {
+            MqttConnectionStateStatus.connected => (
+                'EN LÍNEA (1s)',
+                const Color(0xFF00E676)
+              ),
+            MqttConnectionStateStatus.connecting ||
+            MqttConnectionStateStatus.reconnecting =>
+              (
+                'PASO ${diagnostics.currentStepIndex}/5...',
+                const Color(0xFFFFB300)
+              ),
+            MqttConnectionStateStatus.disconnected => (
+                'SIN RED',
+                const Color(0xFFFF5252)
+              ),
+          };
+
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: () => _openConnectionDiagnosticsDialog(context),
+        borderRadius: BorderRadius.circular(20),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+          decoration: BoxDecoration(
+            color: color.withOpacity(0.15),
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: color.withOpacity(0.7)),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 7,
+                height: 7,
+                decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+              ),
+              const SizedBox(width: 6),
+              Text(
+                label,
+                style: TextStyle(
+                  color: color,
+                  fontSize: 10,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(width: 4),
+              Icon(
+                Icons.info_outline_rounded,
+                size: 13,
+                color: color,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Ventana emergente en vivo que desglosa todas las conexiones y muestra
+  /// en qué paso exacto va si está reconectando o dónde ocurrió un fallo.
+  void _openConnectionDiagnosticsDialog(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (ctx) {
+        return ListenableBuilder(
+          listenable: viewModel,
+          builder: (ctx, _) {
+            final diag = viewModel.diagnostics;
+            final isDemo = viewModel.demoMode;
+            final lastRxStr = diag.lastPacketTime != null
+                ? '${diag.lastPacketTime!.hour.toString().padLeft(2, '0')}:'
+                    '${diag.lastPacketTime!.minute.toString().padLeft(2, '0')}:'
+                    '${diag.lastPacketTime!.second.toString().padLeft(2, '0')}'
+                : 'Ninguno aún';
+
+            return AlertDialog(
+              backgroundColor: const Color(0xFF141D2E),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(20),
+                side: const BorderSide(color: Colors.white12),
+              ),
+              titlePadding: const EdgeInsets.fromLTRB(20, 18, 20, 8),
+              contentPadding: const EdgeInsets.fromLTRB(20, 8, 20, 12),
+              title: Row(
+                children: [
+                  const Icon(
+                    Icons.hub_rounded,
+                    color: Color(0xFF40C4FF),
+                    size: 22,
+                  ),
+                  const SizedBox(width: 10),
+                  const Expanded(
+                    child: Text(
+                      'Diagnóstico de Conexión',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.close, color: Colors.white54, size: 20),
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(),
+                    onPressed: () => Navigator.of(ctx).pop(),
+                  ),
+                ],
+              ),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF0E1522),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: Colors.white10),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            isDemo
+                                ? 'Modo actual: Simulador Local en Celular'
+                                : 'Servidor destino: ${diag.targetHost}:${diag.targetPort}',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 12,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            'Paquetes 1s recibidos: ${diag.packetsReceived}  •  Último: $lastRxStr',
+                            style: const TextStyle(
+                              color: Colors.white70,
+                              fontSize: 11,
+                            ),
+                          ),
+                          if (diag.reconnectAttempt > 0 && !isDemo) ...[
+                            const SizedBox(height: 2),
+                            Text(
+                              'Intentos de reconexión: #${diag.reconnectAttempt}',
+                              style: const TextStyle(
+                                color: Color(0xFFFFB300),
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+
+                    // Lista de los 5 pasos de conexión en tiempo real
+                    ...diag.steps.map(_buildDiagnosticStepTile),
+
+                    if (diag.lastError != null && !isDemo) ...[
+                      const SizedBox(height: 10),
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(10),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFFF5252).withOpacity(0.12),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(
+                            color: const Color(0xFFFF5252).withOpacity(0.5),
+                          ),
+                        ),
+                        child: Text(
+                          '⚠️ Causa detectada:\n${diag.lastError}',
+                          style: const TextStyle(
+                            color: Color(0xFFFF8A80),
+                            fontSize: 11,
+                            height: 1.35,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              actionsPadding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+              actions: [
+                TextButton.icon(
+                  onPressed: () {
+                    Navigator.of(ctx).pop();
+                    _openSettingsSheet(context);
+                  },
+                  icon: const Icon(Icons.settings_rounded, size: 16),
+                  label: const Text('Cambiar IP'),
+                  style: TextButton.styleFrom(
+                    foregroundColor: Colors.white70,
+                  ),
+                ),
+                ElevatedButton.icon(
+                  onPressed: () => viewModel.retryConnectionNow(),
+                  icon: const Icon(Icons.refresh_rounded, size: 16),
+                  label: const Text('Reintentar Ahora'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF00E676),
+                    foregroundColor: Colors.black,
+                  ),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _buildDiagnosticStepTile(ConnectionStepInfo step) {
+    final (IconData icon, Color color) = switch (step.state) {
+      DiagnosticStepState.completed => (
+          Icons.check_circle_rounded,
           const Color(0xFF00E676)
         ),
-      MqttConnectionStateStatus.connecting ||
-      MqttConnectionStateStatus.reconnecting =>
-        ('RECONECTANDO...', const Color(0xFFFFB300)),
-      MqttConnectionStateStatus.disconnected => (
-          'SIN RED LOCAL',
+      DiagnosticStepState.inProgress => (
+          Icons.sync_rounded,
+          const Color(0xFFFFB300)
+        ),
+      DiagnosticStepState.failed => (
+          Icons.error_rounded,
           const Color(0xFFFF5252)
+        ),
+      DiagnosticStepState.pending => (
+          Icons.radio_button_unchecked_rounded,
+          Colors.white24
         ),
     };
 
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-      decoration: BoxDecoration(
-        color: color.withOpacity(0.15),
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: color.withOpacity(0.7)),
-      ),
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 5),
       child: Row(
-        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Container(
-            width: 7,
-            height: 7,
-            decoration: BoxDecoration(color: color, shape: BoxShape.circle),
-          ),
-          const SizedBox(width: 6),
-          Text(
-            label,
-            style: TextStyle(
-              color: color,
-              fontSize: 10,
-              fontWeight: FontWeight.w800,
+          Icon(icon, color: color, size: 18),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  step.title,
+                  style: TextStyle(
+                    color: step.state == DiagnosticStepState.pending
+                        ? Colors.white54
+                        : Colors.white,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  step.detail,
+                  style: TextStyle(
+                    color: step.state == DiagnosticStepState.failed
+                        ? const Color(0xFFFF8A80)
+                        : Colors.white60,
+                    fontSize: 11,
+                  ),
+                ),
+              ],
             ),
           ),
         ],
@@ -292,10 +596,14 @@ class SolarDashboardScreen extends StatelessWidget {
     final isGreen = reading.isHealthyForThreshold(threshold);
     final indicatorColor =
         isGreen ? const Color(0xFF00E676) : const Color(0xFFFF1744);
+    final timeStr =
+        '${reading.timestamp.hour.toString().padLeft(2, '0')}:'
+        '${reading.timestamp.minute.toString().padLeft(2, '0')}:'
+        '${reading.timestamp.second.toString().padLeft(2, '0')}';
 
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
       decoration: BoxDecoration(
         color: const Color(0xFF141C2B),
         border: Border(
@@ -305,40 +613,32 @@ class SolarDashboardScreen extends StatelessWidget {
       child: Row(
         children: [
           Container(
-            width: 14,
-            height: 14,
+            width: 10,
+            height: 10,
             decoration: BoxDecoration(
               color: indicatorColor,
               shape: BoxShape.circle,
-              boxShadow: [
-                BoxShadow(
-                  color: indicatorColor.withOpacity(0.6),
-                  blurRadius: 8,
-                  spreadRadius: 1,
-                ),
-              ],
             ),
           ),
-          const SizedBox(width: 10),
+          const SizedBox(width: 8),
           Expanded(
             child: Text(
-              'Barra de Estado Fija: ${reading.batterySoc.toStringAsFixed(1)}% • ${reading.status.displayName.toUpperCase()} (${reading.batteryVoltage.toStringAsFixed(1)}V)',
+              '${reading.batterySoc.toStringAsFixed(1)}% • ${reading.status.displayName.toUpperCase()} (${reading.batteryVoltage.toStringAsFixed(2)}V)',
               style: const TextStyle(
                 color: Colors.white,
-                fontSize: 12,
+                fontSize: 11,
                 fontWeight: FontWeight.w600,
               ),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
             ),
           ),
-          const SizedBox(width: 8),
           Text(
-            isGreen ? 'ÓPTIMO' : 'ATENCIÓN',
-            style: TextStyle(
-              color: indicatorColor,
+            '⏱ $timeStr',
+            style: const TextStyle(
+              color: Colors.white54,
               fontSize: 11,
-              fontWeight: FontWeight.w800,
+              fontWeight: FontWeight.w600,
             ),
           ),
         ],
@@ -351,9 +651,8 @@ class SolarDashboardScreen extends StatelessWidget {
     final statusColor =
         isGreen ? const Color(0xFF00E676) : const Color(0xFFFF5252);
 
-    // Formatear fuente para que sea limpia y concisa
     final cleanSource = reading.sourceMode.contains('Casa_Falla')
-        ? 'SmartESS (Casa_Falla)'
+        ? 'Casa_Falla (1s)'
         : reading.sourceMode;
 
     return Column(
@@ -376,7 +675,7 @@ class SolarDashboardScreen extends StatelessWidget {
               Expanded(
                 child: _buildMetricCard(
                   title: 'PANELES SOLARES',
-                  value: '${reading.pvPowerW.toStringAsFixed(0)} W',
+                  value: '${reading.pvPowerW.toStringAsFixed(1)} W',
                   subtitle: 'Generación PV actual',
                   icon: Icons.solar_power_rounded,
                   accentColor: const Color(0xFFFFB300),
@@ -394,10 +693,10 @@ class SolarDashboardScreen extends StatelessWidget {
                 child: _buildMetricCard(
                   title: 'FLUJO DE BATERÍA',
                   value: reading.status == SolarSystemStatus.charging
-                      ? '+${reading.batteryChargeW.toStringAsFixed(0)} W'
+                      ? '+${reading.batteryChargeW.toStringAsFixed(1)} W'
                       : reading.status == SolarSystemStatus.discharging
-                          ? '-${reading.batteryDischargeW.toStringAsFixed(0)} W'
-                          : '0 W',
+                          ? '-${reading.batteryDischargeW.toStringAsFixed(1)} W'
+                          : '0.0 W',
                   subtitle: 'Estado: ${reading.status.displayName}',
                   icon: reading.status == SolarSystemStatus.charging
                       ? Icons.trending_up_rounded
@@ -409,7 +708,7 @@ class SolarDashboardScreen extends StatelessWidget {
               Expanded(
                 child: _buildMetricCard(
                   title: 'CONSUMO HOGAR',
-                  value: '${reading.loadPowerW.toStringAsFixed(0)} W',
+                  value: '${reading.loadPowerW.toStringAsFixed(1)} W',
                   subtitle: 'Fuente: $cleanSource',
                   icon: Icons.home_rounded,
                   accentColor: const Color(0xFF40C4FF),

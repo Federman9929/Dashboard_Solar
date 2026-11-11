@@ -45,6 +45,12 @@ class SolarRepository {
 
   Stream<MqttConnectionStateStatus> get connectionStream =>
       _mqttService.connectionStream;
+  Stream<MqttDiagnosticsSnapshot> get diagnosticsStream =>
+      _mqttService.diagnosticsStream;
+  MqttDiagnosticsSnapshot get currentDiagnostics =>
+      _mqttService.currentDiagnostics;
+
+  bool _hasActiveAlertBanner = false;
 
   final _readingStreamController = StreamController<SolarReading>.broadcast();
   final _history24hController =
@@ -142,9 +148,10 @@ class SolarRepository {
   }
 
   void _processIncomingReading(SolarReading reading) {
-    // 1. Mantener ventana en tiempo real (últimos 120 puntos = ~3-4 minutos a 1.5s)
+    // 1. Mantener ventana ligera en tiempo real (últimos 60 puntos = 1 minuto a 1.0s)
+    // para minimizar uso de CPU/GPU en el celular.
     _realtimeReadings.add(reading);
-    if (_realtimeReadings.length > 120) {
+    if (_realtimeReadings.length > 60) {
       _realtimeReadings.removeAt(0);
     }
 
@@ -158,10 +165,10 @@ class SolarRepository {
       _history24hController.add(List.unmodifiable(_history24h));
     }
 
-    _readingStreamController.add(reading);
     _realtimeWindowController.add(List.unmodifiable(_realtimeReadings));
+    _readingStreamController.add(reading);
 
-    // 3. Actualizar Notificación Permanente en la barra de estado
+    // 3. Actualizar Notificación Permanente (con limitador de 15s para no bloquear Android)
     _notificationService.updatePersistentNotification(
       reading,
       threshold: _criticalSocThreshold,
@@ -170,12 +177,14 @@ class SolarRepository {
     // 4. Evaluar umbral crítico configurable por el usuario
     if (reading.batterySoc < _criticalSocThreshold) {
       _triggerCriticalAlertFlow(reading);
-    } else {
+    } else if (_hasActiveAlertBanner) {
+      _hasActiveAlertBanner = false;
       _criticalAlertBannerController.add(null);
     }
   }
 
   void _triggerCriticalAlertFlow(SolarReading reading, {bool force = false}) {
+    _hasActiveAlertBanner = true;
     _criticalAlertBannerController.add(reading);
     _notificationService.triggerCriticalBatteryAlert(
       reading: reading,
@@ -187,8 +196,14 @@ class SolarRepository {
   }
 
   Future<void> silenceCriticalAlert() async {
+    _hasActiveAlertBanner = false;
     _criticalAlertBannerController.add(null);
     await _notificationService.stopCriticalAlarmSound();
+  }
+
+  Future<void> retryConnectionNow() async {
+    if (_demoMode) return;
+    await _mqttService.connect(host: _brokerHost, port: _brokerPort);
   }
 
   Future<void> simulateCriticalAlertTest() async {
@@ -266,6 +281,7 @@ class SolarRepository {
 
     _demoTimer?.cancel();
     if (_demoMode) {
+      await _mqttService.disconnectManual();
       _startLocalDemoStream();
     } else {
       await _mqttService.connect(host: _brokerHost, port: _brokerPort);
@@ -350,7 +366,7 @@ class SolarRepository {
   void _startLocalDemoStream() {
     _demoTimer?.cancel();
     double demoSoc = 76.0;
-    _demoTimer = Timer.periodic(const Duration(milliseconds: 1500), (timer) {
+    _demoTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
       final now = DateTime.now();
       final t = now.millisecondsSinceEpoch / 1000.0;
       final pv = math.max(0.0, 1250.0 * math.sin(t / 18.0) + 950.0);

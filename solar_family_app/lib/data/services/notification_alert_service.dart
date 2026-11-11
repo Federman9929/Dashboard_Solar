@@ -23,6 +23,7 @@ class NotificationAndAlertService {
 
   bool _isInitialized = false;
   DateTime? _lastOngoingUpdate;
+  bool? _lastOngoingIsGreen;
   DateTime? _lastCriticalTrigger;
 
   Future<void> initialize() async {
@@ -62,15 +63,18 @@ class NotificationAndAlertService {
   }) async {
     if (!_isInitialized) await initialize();
 
-    // Limitar actualizaciones de barra de estado a máximo 1 cada 2 segundos
+    final isGreen = reading.isHealthyForThreshold(threshold);
     final now = DateTime.now();
+    // Evitar saturar el canal nativo de Android (que causa ANR "La aplicación no responde")
+    // actualizando la notificación del sistema máximo cada 15 segundos o si cambia el semáforo.
     if (_lastOngoingUpdate != null &&
-        now.difference(_lastOngoingUpdate!).inMilliseconds < 1800) {
+        _lastOngoingIsGreen == isGreen &&
+        now.difference(_lastOngoingUpdate!).inSeconds < 15) {
       return;
     }
     _lastOngoingUpdate = now;
+    _lastOngoingIsGreen = isGreen;
 
-    final isGreen = reading.isHealthyForThreshold(threshold);
     final circleIndicator = reading.statusEmojiForThreshold(threshold); // 🟢 o 🔴
     final indicatorColor =
         isGreen ? const Color(0xFF00E676) : const Color(0xFFFF1744);
