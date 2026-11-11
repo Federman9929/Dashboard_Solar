@@ -75,6 +75,22 @@ class SolarRepository {
   List<SolarReading> get realtimeReadings =>
       List.unmodifiable(_realtimeReadings);
 
+  /// Línea de tiempo unificada que combina el historial de 24h con la ventana
+  /// de alta resolución (1s) para poder consultar desde 1 minuto hasta 24 horas
+  /// en cualquiera de las 3 gráficas (Batería, PV y Carga de la Casa).
+  List<SolarReading> get unifiedTimeline {
+    if (_realtimeReadings.isEmpty) return List.unmodifiable(_history24h);
+    if (_history24h.isEmpty) return List.unmodifiable(_realtimeReadings);
+
+    final firstRealtimeMs = _realtimeReadings.first.epochMs;
+    final merged = <SolarReading>[
+      for (final h in _history24h)
+        if (h.epochMs < firstRealtimeMs) h,
+      ..._realtimeReadings,
+    ];
+    return merged;
+  }
+
   Future<void> initialize() async {
     // Pre-cargar curva inicial de 24h de inmediato para renderizar las gráficas al instante
     _seedInitialHistoryIfNeeded();
@@ -148,18 +164,17 @@ class SolarRepository {
   }
 
   void _processIncomingReading(SolarReading reading) {
-    // 1. Mantener ventana ligera en tiempo real (últimos 60 puntos = 1 minuto a 1.0s)
-    // para minimizar uso de CPU/GPU en el celular.
+    // 1. Mantener ventana en tiempo real de 10 minutos a 1s (600 puntos en RAM = <40KB)
     _realtimeReadings.add(reading);
-    if (_realtimeReadings.length > 60) {
+    if (_realtimeReadings.length > 600) {
       _realtimeReadings.removeAt(0);
     }
 
-    // 2. Añadir al historial de 24h si pasaron al menos 5 minutos desde el último punto
+    // 2. Añadir al historial cada 15 segundos para soportar vistas de 10m, 30m, 1h, 6h y 24h
     if (_history24h.isEmpty ||
-        (reading.epochMs - _history24h.last.epochMs) >= 5 * 60 * 1000) {
+        (reading.epochMs - _history24h.last.epochMs) >= 15 * 1000) {
       _history24h.add(reading);
-      if (_history24h.length > 288) {
+      if (_history24h.length > 720) {
         _history24h.removeAt(0);
       }
       _history24hController.add(List.unmodifiable(_history24h));
@@ -320,44 +335,16 @@ class SolarRepository {
         SolarReading(
           timestamp: dt,
           epochMs: ts,
-          batteryVoltage: double.parse(voltage.toStringAsFixed(2)),
-          batterySoc: double.parse(soc.toStringAsFixed(1)),
+          batteryVoltage: 56.6,
+          batterySoc: 100.0,
           pvPowerW: double.parse(pv.toStringAsFixed(1)),
           batteryPowerW: double.parse(netBatt.toStringAsFixed(1)),
           batteryChargeW: double.parse(chargeW.toStringAsFixed(1)),
           batteryDischargeW: double.parse(dischargeW.toStringAsFixed(1)),
           loadPowerW: double.parse(load.toStringAsFixed(1)),
           status: status,
-          isCritical: soc < 30.0,
-          sourceMode: 'HISTORIAL',
-        ),
-      );
-    }
-
-    // Sembrar también los últimos 30 puntos en tiempo real para que las gráficas luzcan vivas al instante
-    final nowRealtime = DateTime.now().millisecondsSinceEpoch;
-    for (int i = 30; i >= 1; i--) {
-      final ts = nowRealtime - (i * 1500);
-      final wave = math.sin(ts / 12000.0);
-      final pv = 1480.0 + 280.0 * wave;
-      final load = 620.0 + 180.0 * math.cos(ts / 9000.0);
-      final net = pv - load;
-      _realtimeReadings.add(
-        SolarReading(
-          timestamp: DateTime.fromMillisecondsSinceEpoch(ts),
-          epochMs: ts,
-          batteryVoltage: 52.4,
-          batterySoc: 81.2,
-          pvPowerW: pv,
-          batteryPowerW: net,
-          batteryChargeW: net > 0 ? net : 0.0,
-          batteryDischargeW: net < 0 ? net.abs() : 0.0,
-          loadPowerW: load,
-          status: net > 20
-              ? SolarSystemStatus.charging
-              : SolarSystemStatus.discharging,
           isCritical: false,
-          sourceMode: 'INICIAL',
+          sourceMode: 'HISTORIAL',
         ),
       );
     }

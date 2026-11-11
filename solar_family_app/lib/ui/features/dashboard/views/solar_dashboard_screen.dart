@@ -120,15 +120,16 @@ class SolarDashboardScreen extends StatelessWidget {
     required int selectedIndex,
     required double threshold,
   }) {
+    final timeline = viewModel.unifiedTimeline;
     switch (selectedIndex) {
       case 0:
         return InteractiveSolarChart(
           key: const ValueKey('chart_battery'),
           title: 'Nivel de Batería (SOC %)',
           subtitle:
-              'Historial 24h y umbral configurado en ${threshold.toStringAsFixed(0)}%',
+              'Umbral de aviso configurado en ${threshold.toStringAsFixed(0)}%',
           unit: '%',
-          readings: viewModel.history24h,
+          readings: timeline,
           valueSelector: (r) => r.batterySoc,
           lineColor: const Color(0xFF00E676),
           gradientColor: const Color(0xFF00C853),
@@ -136,34 +137,34 @@ class SolarDashboardScreen extends StatelessWidget {
           maxY: 100,
           thresholdY: threshold,
           thresholdLabel: 'Umbral ${threshold.toStringAsFixed(0)}%',
-          showSecondsInTooltip: false,
+          initialRangeIndex: 5, // 24h por defecto en batería
         );
       case 1:
         return InteractiveSolarChart(
           key: const ValueKey('chart_pv'),
-          title: 'Generación Solar PV (Tiempo Real 1s)',
-          subtitle: 'Potencia entregada por los paneles solares segundo a segundo',
+          title: 'Generación Solar PV (W)',
+          subtitle: 'Potencia entregada por los paneles solares',
           unit: 'W',
-          readings: viewModel.realtimeReadings,
+          readings: timeline,
           valueSelector: (r) => r.pvPowerW,
           lineColor: const Color(0xFFFFB300),
           gradientColor: const Color(0xFFFF8F00),
           minY: 0,
-          showSecondsInTooltip: true,
+          initialRangeIndex: 1, // 10m por defecto en PV
         );
       case 2:
       default:
         return InteractiveSolarChart(
           key: const ValueKey('chart_load'),
-          title: 'Carga / Consumo de la Casa (Tiempo Real 1s)',
-          subtitle: 'Potencia consumida por el hogar segundo a segundo',
+          title: 'Carga / Consumo de la Casa (W)',
+          subtitle: 'Potencia consumida por el hogar',
           unit: 'W',
-          readings: viewModel.realtimeReadings,
+          readings: timeline,
           valueSelector: (r) => r.loadPowerW,
           lineColor: const Color(0xFF40C4FF),
           gradientColor: const Color(0xFF00B0FF),
           minY: 0,
-          showSecondsInTooltip: true,
+          initialRangeIndex: 1, // 10m por defecto en Consumo
         );
     }
   }

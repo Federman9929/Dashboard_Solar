@@ -91,18 +91,29 @@ class LocalHistoryDB:
                     pv_power_w REAL NOT NULL,
                     battery_power_w REAL NOT NULL,
                     battery_discharge_w REAL NOT NULL,
-                    status TEXT NOT NULL
+                    status TEXT NOT NULL,
+                    load_power_w REAL NOT NULL DEFAULT 0.0
                 )
                 """
             )
+            try:
+                conn.execute(
+                    "ALTER TABLE telemetry_history ADD COLUMN load_power_w REAL NOT NULL DEFAULT 0.0"
+                )
+            except sqlite3.OperationalError:
+                pass
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_epoch_ms ON telemetry_history(epoch_ms)"
             )
-            # Pre-poblar con 24h de curva solar realista si la base de datos está recién creada
+            # Limpiar registros antiguos con voltaje inválido (40.0V / 75.0% del endpoint anterior)
+            conn.execute(
+                "DELETE FROM telemetry_history WHERE battery_voltage <= 41.0"
+            )
+            conn.commit()
             cursor = conn.execute("SELECT COUNT(*) FROM telemetry_history")
             count = cursor.fetchone()[0]
             if count == 0:
-                logger.info("Inicializando base de datos con curva histórica de las últimas 24h...")
+                logger.info("Inicializando base de datos con curva histórica base de 24h...")
                 self._seed_24h_history(conn)
 
     def _seed_24h_history(self, conn: sqlite3.Connection) -> None:
@@ -154,8 +165,8 @@ class LocalHistoryDB:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO telemetry_history
-                (epoch_ms, battery_voltage, battery_soc, pv_power_w, battery_power_w, battery_discharge_w, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (epoch_ms, battery_voltage, battery_soc, pv_power_w, battery_power_w, battery_discharge_w, status, load_power_w)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     sample.epoch_ms,
@@ -165,6 +176,7 @@ class LocalHistoryDB:
                     sample.battery_power_w,
                     sample.battery_discharge_w,
                     sample.status,
+                    sample.load_power_w,
                 ),
             )
             # Limpiar datos de más de 24 horas
@@ -172,13 +184,42 @@ class LocalHistoryDB:
             conn.execute("DELETE FROM telemetry_history WHERE epoch_ms < ?", (cutoff_ms,))
             conn.commit()
 
-    def get_last_24h_downsampled(self, max_points: int = 288) -> List[Dict]:
+    def bulk_upsert_cloud_history(self, points: List[Dict]) -> None:
+        if not points:
+            return
+        rows = [
+            (
+                int(p["epoch_ms"]),
+                float(p["battery_voltage"]),
+                float(p["battery_soc"]),
+                float(p["pv_power_w"]),
+                float(p["battery_power_w"]),
+                float(p["battery_discharge_w"]),
+                str(p["status"]),
+                float(p.get("load_power_w", 0.0)),
+            )
+            for p in points
+        ]
+        with sqlite3.connect(self.db_path) as conn:
+            # Eliminar puntos sintéticos antiguos donde load_power_w era 0.0
+            conn.execute("DELETE FROM telemetry_history WHERE load_power_w <= 0.0")
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO telemetry_history
+                (epoch_ms, battery_voltage, battery_soc, pv_power_w, battery_power_w, battery_discharge_w, status, load_power_w)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            conn.commit()
+
+    def get_last_24h_downsampled(self, max_points: int = 500) -> List[Dict]:
         """Devuelve hasta `max_points` muestras de las últimas 24 horas para gráficas ágiles."""
         cutoff_ms = int(time.time() * 1000) - (24 * 3600 * 1000)
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
                 """
-                SELECT epoch_ms, battery_voltage, battery_soc, pv_power_w, battery_power_w, battery_discharge_w, status
+                SELECT epoch_ms, battery_voltage, battery_soc, pv_power_w, battery_power_w, battery_discharge_w, status, load_power_w
                 FROM telemetry_history
                 WHERE epoch_ms >= ?
                 ORDER BY epoch_ms ASC
@@ -204,6 +245,7 @@ class LocalHistoryDB:
                 "battery_power_w": r[4],
                 "battery_discharge_w": r[5],
                 "status": r[6],
+                "load_power_w": r[7] if r[7] > 0 else max(0.0, round(r[3] - r[4], 1)),
             }
             for r in sampled
         ]
@@ -697,7 +739,7 @@ class SolarBackendService:
             logger.error(f"Error procesando comando MQTT: {exc}")
 
     def _publish_24h_history(self) -> None:
-        history_points = self.db.get_last_24h_downsampled(max_points=288)
+        history_points = self.db.get_last_24h_downsampled(max_points=500)
         payload = json.dumps(
             {
                 "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -710,6 +752,21 @@ class SolarBackendService:
         self.mqtt_client.publish(self.topic_history, payload, qos=1, retain=True)
         logger.info(f"Historial de 24h publicado en {self.topic_history} ({len(history_points)} puntos)")
 
+    def _sync_real_cloud_history_once(self) -> None:
+        """Sincroniza el historial real de 24h del inversor en segundo plano al iniciar."""
+        try:
+            if self.mode == "SMARTESS_CLOUD":
+                self.reader.read_telemetry()
+                cloud_client = getattr(self.reader, "_smartess_client", None)
+                if cloud_client is not None:
+                    real_points = cloud_client.fetch_real_24h_history()
+                    if real_points:
+                        self.db.bulk_upsert_cloud_history(real_points)
+                        logger.info(f"Sincronizados {len(real_points)} puntos históricos reales de 24h desde Casa_Falla.")
+                        self._publish_24h_history()
+        except Exception as e:
+            logger.warning(f"No se pudo sincronizar historial 24h inicial de nube: {e}")
+
     def start(self) -> None:
         logger.info(f"Iniciando Servicio Solar Local en modo: {self.mode}")
         while self.running:
@@ -721,6 +778,9 @@ class SolarBackendService:
                 logger.warning(f"Esperando al broker Mosquitto en {self.mqtt_host}:{self.mqtt_port} ({exc})...")
                 time.sleep(3)
 
+        import threading
+        threading.Thread(target=self._sync_real_cloud_history_once, daemon=True).start()
+
         while self.running:
             loop_start = time.time()
             try:
@@ -730,16 +790,16 @@ class SolarBackendService:
                 # Publicar lectura en tiempo real (QoS 1 y retain=True para estado inmediato)
                 self.mqtt_client.publish(self.topic_telemetry, payload_str, qos=1, retain=True)
 
-                # Verificar si la batería bajó del 30%
+                # Verificar si la batería bajó del umbral configurado
                 self.alert_manager.check_and_trigger(telemetry, self.mqtt_client, self.topic_alert)
 
-                # Guardar muestra en base de datos SQLite cada 60 segundos y actualizar tópico de 24h
+                # Guardar muestra en base de datos SQLite cada 15 segundos para alta resolución en rangos cortos
                 now = time.time()
-                if (now - self._last_history_save_time) >= 60.0:
+                if (now - self._last_history_save_time) >= 15.0:
                     self.db.insert_sample(telemetry)
                     self._last_history_save_time = now
 
-                if (now - self._last_history_publish_time) >= 120.0:
+                if (now - self._last_history_publish_time) >= 60.0:
                     self._publish_24h_history()
                     self._last_history_publish_time = now
 

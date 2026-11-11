@@ -20,6 +20,8 @@ class SolarDashboardViewModel extends ChangeNotifier {
   List<SolarReading> _realtimeReadings = const [];
   List<SolarReading> get realtimeReadings => _realtimeReadings;
 
+  List<SolarReading> get unifiedTimeline => _repository.unifiedTimeline;
+
   SolarReading? _activeCriticalAlert;
   SolarReading? get activeCriticalAlert => _activeCriticalAlert;
 
