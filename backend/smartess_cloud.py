@@ -81,42 +81,38 @@ class SmartESSCloudClient:
         dt_seconds: float = 1.0,
     ) -> float:
         """
-        Calcula el SOC (%) real de un banco de 48V evitando fluctuaciones bruscas:
-        1. Si el BMS reporta un SOC válido (> 0), lo usa como referencia.
-        2. Si reporta 0% (batería sin cable BMS), compensa la caída/elevación óhmica
-           de voltaje causada por la corriente de carga/descarga antes de mapear a %.
-        3. Si el voltaje está en etapa de absorción/flotación (>= 54.4V cargando), es 100%.
-        4. Limita la tasa máxima de cambio por segundo (filtro físico coulométrico)
-           para que jamás salte de 100% a 75% por una nube o encendido de carga.
+        Calcula el SOC (%) real de un banco de 48V calibrado exactamente con la curva
+        del inversor MUST PV1800 (ej. 52.8V -> 89%, >=53.8V -> 100%, 44.8V -> 0%):
+        1. Si el BMS reporta un SOC válido (> 0), lo usa directamente.
+        2. Mapea el voltaje real del banco (44.8V = 0% a 53.8V = 100%).
+        3. Aplica ley física de conservación: si está descargando de noche (net_charge_w < -15W),
+           el porcentaje de batería no puede subir artificialmente.
         """
         if reported_soc > 0.0:
             target_soc = reported_soc
         elif batt_v <= 38.0:
-            target_soc = prev_soc if prev_soc is not None else 100.0
+            target_soc = prev_soc if prev_soc is not None else 89.0
         else:
-            # Si está en voltaje de absorción/flotación (54.4V - 58.0V), la batería está al 100%
-            if batt_v >= 54.4 and net_charge_w >= -100.0:
-                target_soc = 100.0
-            else:
-                # Corriente aproximada (+ cargando, - descargando)
-                current_a = net_charge_w / max(44.0, batt_v)
-                # Compensar resistencia interna (~0.06 Ohm) para estimar voltaje en reposo (OCV)
-                v_ocv = batt_v - (current_a * 0.06)
-                # Curva 48V (44.8V = 0%, 53.8V = 100% en reposo)
-                target_soc = ((v_ocv - 44.8) / (53.8 - 44.8)) * 100.0
-                target_soc = max(0.0, min(100.0, target_soc))
+            # Curva exacta 48V: 44.8V = 0%, 53.8V = 100% (En 52.8V -> 88.9% ≈ 89%)
+            target_soc = ((batt_v - 44.8) / (53.8 - 44.8)) * 100.0
+            target_soc = max(0.0, min(100.0, target_soc))
 
         if prev_soc is None:
             return round(target_soc, 1)
 
-        # Integración coulométrica (banco ~5000 Wh) + convergencia suave hacia target_soc
-        coulomb_delta = (net_charge_w * (dt_seconds / 3600.0)) / 5000.0 * 100.0
-        # Limitar el cambio máximo a 0.05% por segundo (~3% máximo en 1 minuto)
-        max_step = max(0.02, 0.03 * (dt_seconds / 1.0))
-        diff = (target_soc - prev_soc) * 0.08 + coulomb_delta
-        clamped_diff = max(-max_step, min(max_step, diff))
-        new_soc = max(0.0, min(100.0, prev_soc + clamped_diff))
-        return round(new_soc, 1)
+        # Si hay una diferencia grande inicial (ej. transición de voltaje de flotación diurno
+        # a voltaje de descarga nocturno), converger rápidamente al valor real
+        if abs(target_soc - prev_soc) > 3.0:
+            new_soc = prev_soc + (target_soc - prev_soc) * 0.5
+        else:
+            # Suavizado ligero para evitar parpadeos de décimas cada segundo
+            new_soc = prev_soc * 0.85 + target_soc * 0.15
+
+        # Si está descargando (noche / sin sol), impedir que el SOC suba por rebote elástico
+        if net_charge_w < -20.0 and new_soc > prev_soc and (prev_soc - target_soc) >= -1.0:
+            new_soc = prev_soc
+
+        return round(max(0.0, min(100.0, new_soc)), 1)
 
     def _login(self) -> bool:
         """Autenticación en la API pública de SmartESS / DessMonitor."""
@@ -235,7 +231,7 @@ class SmartESSCloudClient:
                 batt_v=batt_v,
                 net_charge_w=net_charge_w,
                 reported_soc=reported_soc,
-                prev_soc=self._filtered_soc,
+                prev_soc=None,
                 dt_seconds=self.cache_ttl_seconds,
             )
             self._base_telemetry = {

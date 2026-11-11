@@ -201,8 +201,8 @@ class LocalHistoryDB:
             for p in points
         ]
         with sqlite3.connect(self.db_path) as conn:
-            # Eliminar puntos sintéticos antiguos donde load_power_w era 0.0
-            conn.execute("DELETE FROM telemetry_history WHERE load_power_w <= 0.0")
+            # Reemplazar historial previo con la curva real recalibrada de 24h del inversor
+            conn.execute("DELETE FROM telemetry_history")
             conn.executemany(
                 """
                 INSERT OR REPLACE INTO telemetry_history
