@@ -108,14 +108,14 @@ class LocalHistoryDB:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_epoch_ms ON telemetry_history(epoch_ms)"
             )
-            # Limpiar una única vez registros antiguos descalibrados (ej. 85% / 97% en noche o 40V)
+            # Limpiar una única vez registros antiguos descalibrados (ej. 85% / 97% / 70% fijo en noche)
             meta_cur = conn.execute(
-                "SELECT val FROM db_meta WHERE key = 'soc_calibration_v4'"
+                "SELECT val FROM db_meta WHERE key = 'soc_calibration_v6'"
             )
             if meta_cur.fetchone() is None:
                 conn.execute("DELETE FROM telemetry_history")
                 conn.execute(
-                    "INSERT OR REPLACE INTO db_meta (key, val) VALUES ('soc_calibration_v4', '1')"
+                    "INSERT OR REPLACE INTO db_meta (key, val) VALUES ('soc_calibration_v6', '1')"
                 )
             conn.commit()
             cursor = conn.execute("SELECT COUNT(*) FROM telemetry_history")
@@ -211,10 +211,9 @@ class LocalHistoryDB:
             for p in points
         ]
         with sqlite3.connect(self.db_path) as conn:
-            # INSERT OR IGNORE evita sobrescribir o alterar muestras históricas ya consolidadas
             conn.executemany(
                 """
-                INSERT OR IGNORE INTO telemetry_history
+                INSERT OR REPLACE INTO telemetry_history
                 (epoch_ms, battery_voltage, battery_soc, pv_power_w, battery_power_w, battery_discharge_w, status, load_power_w)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
@@ -768,6 +767,12 @@ class SolarBackendService:
             logger.error(f"Error procesando comando MQTT: {exc}")
 
     def _publish_24h_history(self) -> None:
+        if self.mode == "SMARTESS_CLOUD":
+            cloud_client = getattr(self.reader, "_smartess_client", None)
+            if cloud_client is not None:
+                cached = getattr(cloud_client, "_cached_24h_history", None)
+                if cached:
+                    self.db.bulk_upsert_cloud_history(cached)
         history_points = self.db.get_last_24h_downsampled(max_points=500)
         payload = json.dumps(
             {

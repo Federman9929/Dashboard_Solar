@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 Módulo cliente resiliente de alta precisión para SmartESS / DessMonitor (MUST PV1800).
-- Usa `queryDeviceLastData` para obtener el Voltaje Real de Batería (ej. 52.4V -> 70%),
-  Corriente de Batería, Potencia PV (W) y Consumo Casa PLoad (W).
-- Calibrado exactamente con la tabla de voltaje/SOC del inversor MUST PV1800 (48V):
-  52.4V = 70.0%, 52.8V = 89.0%, >= 53.03V = 100.0%.
-- Sin fluctuaciones artificiales de voltaje ni reinicios de filtro cada 5s.
+- Resuelve el fallo del datalogger Wi-Fi Plug Pro (Q0033239858759), el cual pierde la trama
+  del BMS en ~65% de los paquetes enviando `SOC = 0%` (lo que genera picos a cero en la app
+  original del proveedor).
+- Ancla el nivel de batería a los paquetes reales del BMS (`SOC > 0`) e integra
+  coulométricamente la potencia real de batería (`batt power` sobre el banco de 4910 Wh)
+  durante los paquetes donde el datalogger reporta `SOC = 0%`.
 """
 
 import hashlib
@@ -23,20 +24,24 @@ from urllib3.util.retry import Retry
 
 logger = logging.getLogger("SmartESSCloud")
 
-# Tabla de calibración exacta del inversor MUST PV1800 (banco 48V / 51.2V)
-# Puntos verificados directamente contra la pantalla del inversor:
-# - 52.30 V .. 52.40 V -> ~70.0 % (meseta estable sin saltos bruscos por 0.1V)
-# - 52.80 V -> 89.0 %
-# - >= 53.05 V -> 100.0 %
-INVERTER_SOC_CURVE: List[Tuple[float, float]] = [
+# Capacidad efectiva medida del banco LiFePO4 de Casa_Falla a partir de los puntos reales del BMS:
+# (De 17:44 [89%] a 20:45 [43%] se descargaron 2260 Wh para 46% de caída -> 4913 Wh por 100%).
+BATTERY_EFFECTIVE_CAPACITY_WH = 4910.0
+
+# Curva de respaldo solo en caso extremo de no existir ningún punto BMS en las últimas 24h
+FALLBACK_VOLTAGE_CURVE: List[Tuple[float, float]] = [
     (48.00, 0.0),
-    (50.00, 15.0),
-    (51.20, 40.0),
-    (52.00, 62.0),
-    (52.30, 69.5),
-    (52.40, 70.5),
-    (52.80, 89.0),
-    (53.05, 100.0),
+    (50.50, 15.0),
+    (51.80, 35.0),
+    (52.00, 43.0),
+    (52.10, 48.0),
+    (52.20, 60.0),
+    (52.40, 68.0),
+    (52.60, 71.0),
+    (52.80, 80.0),
+    (52.90, 89.0),
+    (53.10, 96.0),
+    (54.00, 100.0),
 ]
 
 
@@ -68,7 +73,10 @@ class SmartESSCloudClient:
         self._base_telemetry: Optional[Dict[str, Any]] = None
         self._last_fetch_time: float = 0.0
         self._filtered_soc: Optional[float] = None
-        self._last_tick_time: float = time.time()
+        self._last_coulomb_time: Optional[float] = None
+        self._last_remote_raw_ts: Optional[str] = None
+        self._cached_24h_history: List[Dict[str, Any]] = []
+        self._last_history_sync_time: float = 0.0
 
         # Sesión HTTP con Keep-Alive y Retry automático
         self.session = requests.Session()
@@ -87,60 +95,28 @@ class SmartESSCloudClient:
         self._bg_thread.start()
 
     @staticmethod
-    def voltage_to_inverter_soc(batt_v: float) -> float:
-        """
-        Interpolación lineal por tramos calibrada exactamente con el inversor MUST PV1800.
-        Garantiza:
-        - 52.4 V -> 70.0%
-        - 52.8 V -> 89.0%
-        - >= 53.03 V -> 100.0%
-        """
-        if batt_v <= INVERTER_SOC_CURVE[0][0]:
+    def voltage_to_fallback_soc(batt_v: float) -> float:
+        if batt_v <= FALLBACK_VOLTAGE_CURVE[0][0]:
             return 0.0
-        if batt_v >= INVERTER_SOC_CURVE[-1][0]:
+        if batt_v >= FALLBACK_VOLTAGE_CURVE[-1][0]:
             return 100.0
-
-        for i in range(len(INVERTER_SOC_CURVE) - 1):
-            v0, s0 = INVERTER_SOC_CURVE[i]
-            v1, s1 = INVERTER_SOC_CURVE[i + 1]
+        for i in range(len(FALLBACK_VOLTAGE_CURVE) - 1):
+            v0, s0 = FALLBACK_VOLTAGE_CURVE[i]
+            v1, s1 = FALLBACK_VOLTAGE_CURVE[i + 1]
             if v0 <= batt_v <= v1:
                 ratio = (batt_v - v0) / (v1 - v0)
                 return round(s0 + ratio * (s1 - s0), 1)
-        return 70.0
+        return 50.0
 
-    @classmethod
-    def compute_accurate_soc(
-        cls,
-        batt_v: float,
-        net_charge_w: float,
-        reported_soc: float = 0.0,
-        prev_soc: Optional[float] = None,
-        dt_seconds: float = 1.0,
-    ) -> float:
+    @staticmethod
+    def coulomb_step_soc(prev_soc: float, net_charge_w: float, dt_seconds: float) -> float:
         """
-        Calcula el SOC (%) exacto del inversor y aplica suavizado causal
-        para evitar saltos bruscos en la gráfica sin alterar lecturas pasadas.
+        Integra el cambio de SOC (%) por conteo de amperios-hora / vatios-hora (Coulomb counting)
+        sobre la capacidad real de 4910 Wh del banco de baterías.
         """
-        if reported_soc > 0.0:
-            target_soc = reported_soc
-        elif batt_v <= 38.0:
-            target_soc = prev_soc if prev_soc is not None else 70.0
-        else:
-            target_soc = cls.voltage_to_inverter_soc(batt_v)
-
-        if prev_soc is None:
-            return round(target_soc, 1)
-
-        # Filtro exponencial suave: en historial (dt=300s) sigue el valor real sin rezago excesivo;
-        # en tiempo real (dt<=5s) filtra cualquier parpadeo de 0.1V del ADC.
-        alpha = 0.65 if dt_seconds >= 60.0 else 0.25
-        new_soc = prev_soc * (1.0 - alpha) + target_soc * alpha
-
-        # Si está descargando claramente (noche / sin sol), evitar que el SOC suba por rebote
-        if net_charge_w < -25.0 and new_soc > prev_soc and (target_soc - prev_soc) < 3.0:
-            new_soc = prev_soc
-
-        return round(max(0.0, min(100.0, new_soc)), 1)
+        dt_hours = max(0.0, min(3600.0, dt_seconds)) / 3600.0
+        delta_soc = (net_charge_w * dt_hours / BATTERY_EFFECTIVE_CAPACITY_WH) * 100.0
+        return max(0.0, min(100.0, prev_soc + delta_soc))
 
     def _login(self) -> bool:
         """Autenticación en la API pública de SmartESS / DessMonitor."""
@@ -216,6 +192,14 @@ class SmartESSCloudClient:
         if not self._ensure_token():
             return
 
+        # Si aún no tenemos el ancla real del BMS (o cada 3 minutos para re-sincronizar con el historial),
+        # reconstruir el historial de 24h que extrae todos los puntos donde `SOC > 0`.
+        now = time.time()
+        if self._filtered_soc is None or (now - self._last_history_sync_time) >= 180.0:
+            history_pts = self.fetch_real_24h_history()
+            if history_pts:
+                self._last_history_sync_time = now
+
         last_action = (
             f"&action=queryDeviceLastData&source=1"
             f"&devcode={self.devcode}&pn={self.pn}&devaddr={self.devaddr}&sn={self.sn}&i18n=en_US"
@@ -244,19 +228,43 @@ class SmartESSCloudClient:
         reported_soc = float(kv.get("SOC", 0.0) or 0.0)
         inverter_v = float(kv.get("Inverter Voltage", 240.0) or 240.0)
         work_state = str(kv.get("work state", "OffGrid")).strip()
+        raw_ts = str(kv.get("Timestamp", "")).strip()
 
         net_charge_w = -raw_batt_w
         if abs(net_charge_w) < 1.0 and (pv_power_w > 0 or load_power_w > 0):
             net_charge_w = round(pv_power_w - load_power_w, 1)
 
         with self._lock:
-            self._filtered_soc = self.compute_accurate_soc(
-                batt_v=batt_v,
-                net_charge_w=net_charge_w,
-                reported_soc=reported_soc,
-                prev_soc=self._filtered_soc,
-                dt_seconds=self.cache_ttl_seconds,
+            dt_coulomb = (
+                max(0.1, min(30.0, now - self._last_coulomb_time))
+                if self._last_coulomb_time is not None
+                else self.cache_ttl_seconds
             )
+            self._last_coulomb_time = now
+
+            if reported_soc > 0.0:
+                # ¡Llegó una trama con lectura válida del BMS del inversor!
+                if self._filtered_soc is None or raw_ts != self._last_remote_raw_ts:
+                    self._filtered_soc = round(reported_soc, 1)
+                else:
+                    self._filtered_soc = round(
+                        self.coulomb_step_soc(self._filtered_soc, net_charge_w, dt_coulomb),
+                        2,
+                    )
+            else:
+                # El datalogger envió SOC=0 (pérdida intermitente de trama BMS).
+                # Mantenemos el conteo coulométrico continuo desde el último SOC real del BMS.
+                if self._filtered_soc is not None:
+                    self._filtered_soc = round(
+                        self.coulomb_step_soc(self._filtered_soc, net_charge_w, dt_coulomb),
+                        2,
+                    )
+                else:
+                    self._filtered_soc = self.voltage_to_fallback_soc(batt_v)
+
+            self._last_remote_raw_ts = raw_ts
+            display_soc = round(self._filtered_soc, 1)
+
             self._base_telemetry = {
                 "plant_name": self.plant_alias,
                 "inverter_sn": self.sn,
@@ -264,22 +272,25 @@ class SmartESSCloudClient:
                 "pv_power_w": pv_power_w,
                 "load_power_w": load_power_w,
                 "battery_power_w": net_charge_w,
-                "battery_soc": self._filtered_soc,
+                "battery_soc": display_soc,
                 "battery_voltage": round(batt_v, 2),
                 "inverter_voltage": inverter_v,
                 "work_state": work_state,
-                "raw_timestamp": kv.get("Timestamp"),
+                "raw_timestamp": raw_ts,
             }
-            self._last_fetch_time = time.time()
+            self._last_fetch_time = now
 
     def fetch_real_24h_history(self) -> List[Dict[str, Any]]:
         """
-        Descarga las últimas 24 horas reales registradas por el inversor MUST PV1800
-        desde `queryDeviceDataOneDayPaging` (ayer y hoy) con la curva exacta de batería
-        y suavizado causal para que la línea sea limpia e inmutable.
+        Descarga las últimas 24 horas reales del inversor MUST PV1800 y reconstruye
+        la curva exacta del BMS eliminando los falsos ceros (`SOC = 0%`) del datalogger:
+        1. Conserva intactos todos los puntos donde el BMS reportó `SOC > 0`
+           (ej. 89%, 84%, 81%, 78%, 76%, 74%, 71%, 68%, 64%, 61%, 57%, 50%, 46%, 43%).
+        2. Interpola coulométricamente los puntos intermedios donde `SOC == 0`.
+        3. Integra coulométricamente desde el último punto BMS válido hasta el presente.
         """
         if not self._ensure_token():
-            return []
+            return self._cached_24h_history
 
         now_local = datetime.now()
         dates = [
@@ -287,8 +298,7 @@ class SmartESSCloudClient:
             now_local.strftime("%Y-%m-%d"),
         ]
         cutoff_ms = int((now_local - timedelta(hours=24)).timestamp() * 1000)
-        points_by_epoch: Dict[int, Dict[str, Any]] = {}
-        running_soc: Optional[float] = None
+        raw_points_by_epoch: Dict[int, Dict[str, Any]] = {}
 
         for date_str in dates:
             try:
@@ -328,14 +338,6 @@ class SmartESSCloudClient:
                         else 0.0
                     )
                     net_charge_w = -raw_batt_w if abs(raw_batt_w) > 0 else (pv_w - load_w)
-
-                    running_soc = self.compute_accurate_soc(
-                        batt_v=batt_v,
-                        net_charge_w=net_charge_w,
-                        reported_soc=rep_soc,
-                        prev_soc=running_soc,
-                        dt_seconds=300.0,
-                    )
                     charge_w = max(0.0, net_charge_w)
                     discharge_w = max(0.0, -net_charge_w)
                     status = (
@@ -344,11 +346,12 @@ class SmartESSCloudClient:
                         else ("descargando" if net_charge_w < -15.0 else "en_reposo")
                     )
 
-                    points_by_epoch[epoch_ms] = {
+                    raw_points_by_epoch[epoch_ms] = {
                         "epoch_ms": epoch_ms,
                         "timestamp": dt_obj.isoformat(),
                         "battery_voltage": round(batt_v, 2),
-                        "battery_soc": running_soc,
+                        "reported_soc": rep_soc,
+                        "battery_soc": rep_soc,
                         "pv_power_w": round(pv_w, 1),
                         "battery_power_w": round(net_charge_w, 1),
                         "battery_charge_w": round(charge_w, 1),
@@ -359,26 +362,88 @@ class SmartESSCloudClient:
             except Exception as e:
                 logger.warning(f"Error descargando historial de {date_str}: {e}")
 
-        sorted_epochs = sorted(points_by_epoch.keys())
-        ordered = [points_by_epoch[k] for k in sorted_epochs]
+        if not raw_points_by_epoch:
+            return self._cached_24h_history
 
-        # Aplicar media móvil causal de 3 puntos sobre battery_soc para suavizar escalones de 0.1V
-        if len(ordered) >= 3:
-            raw_socs = [p["battery_soc"] for p in ordered]
-            for i in range(1, len(ordered)):
-                if i == 1:
-                    ordered[i]["battery_soc"] = round(raw_socs[0] * 0.35 + raw_socs[1] * 0.65, 1)
-                else:
-                    ordered[i]["battery_soc"] = round(
-                        raw_socs[i - 2] * 0.20 + raw_socs[i - 1] * 0.35 + raw_socs[i] * 0.45,
-                        1,
-                    )
+        sorted_epochs = sorted(raw_points_by_epoch.keys())
+        ordered = [raw_points_by_epoch[k] for k in sorted_epochs]
+
+        # Identificar índices donde el BMS reportó un SOC válido (> 0)
+        valid_indices = [i for i, p in enumerate(ordered) if p["reported_soc"] > 0.0]
+
+        if not valid_indices:
+            # Respaldo si ningún punto tuvo SOC > 0
+            running = self.voltage_to_fallback_soc(ordered[0]["battery_voltage"])
+            for i, p in enumerate(ordered):
+                if i > 0:
+                    dt_s = (p["epoch_ms"] - ordered[i - 1]["epoch_ms"]) / 1000.0
+                    running = self.coulomb_step_soc(running, p["battery_power_w"], dt_s)
+                p["battery_soc"] = round(running, 1)
+                p.pop("reported_soc", None)
+            return ordered
+
+        # 1. Rellenar hacia atrás antes del primer punto BMS válido usando integración inversa
+        first_valid_idx = valid_indices[0]
+        ordered[first_valid_idx]["battery_soc"] = round(ordered[first_valid_idx]["reported_soc"], 1)
+        for i in range(first_valid_idx - 1, -1, -1):
+            dt_s = (ordered[i + 1]["epoch_ms"] - ordered[i]["epoch_ms"]) / 1000.0
+            dt_h = max(0.0, min(3600.0, dt_s)) / 3600.0
+            delta_soc = (ordered[i + 1]["battery_power_w"] * dt_h / BATTERY_EFFECTIVE_CAPACITY_WH) * 100.0
+            prev_soc = max(0.0, min(100.0, ordered[i + 1]["battery_soc"] - delta_soc))
+            ordered[i]["battery_soc"] = round(prev_soc, 1)
+
+        # 2. Interpolar entre cada par de anclas reales del BMS (eliminando los picos a 0%)
+        for k in range(len(valid_indices) - 1):
+            idx_a = valid_indices[k]
+            idx_b = valid_indices[k + 1]
+            soc_a = ordered[idx_a]["reported_soc"]
+            soc_b = ordered[idx_b]["reported_soc"]
+            ordered[idx_a]["battery_soc"] = round(soc_a, 1)
+            ordered[idx_b]["battery_soc"] = round(soc_b, 1)
+
+            if idx_b - idx_a > 1:
+                t_a = ordered[idx_a]["epoch_ms"]
+                t_b = max(t_a + 1, ordered[idx_b]["epoch_ms"])
+                for m in range(idx_a + 1, idx_b):
+                    frac = (ordered[m]["epoch_ms"] - t_a) / (t_b - t_a)
+                    interp_soc = soc_a + frac * (soc_b - soc_a)
+                    ordered[m]["battery_soc"] = round(interp_soc, 1)
+
+        # 3. Integrar coulométricamente hacia adelante después del último punto BMS válido
+        last_valid_idx = valid_indices[-1]
+        running_soc = float(ordered[last_valid_idx]["reported_soc"])
+        ordered[last_valid_idx]["battery_soc"] = round(running_soc, 1)
+
+        for i in range(last_valid_idx + 1, len(ordered)):
+            dt_s = (ordered[i]["epoch_ms"] - ordered[i - 1]["epoch_ms"]) / 1000.0
+            running_soc = self.coulomb_step_soc(
+                running_soc, ordered[i]["battery_power_w"], dt_s
+            )
+            ordered[i]["battery_soc"] = round(running_soc, 1)
+
+        # Además, proyectar desde el último registro de la tabla hasta `now` para el estado en vivo
+        last_row_epoch_s = ordered[-1]["epoch_ms"] / 1000.0
+        now_s = time.time()
+        dt_since_last_row = max(0.0, min(900.0, now_s - last_row_epoch_s))
+        live_projected_soc = self.coulomb_step_soc(
+            running_soc, ordered[-1]["battery_power_w"], dt_since_last_row
+        )
+
+        for p in ordered:
+            p.pop("reported_soc", None)
+
+        with self._lock:
+            self._cached_24h_history = ordered
+            # Anclar el filtro en tiempo real al valor exacto proyectado desde el BMS
+            self._filtered_soc = round(live_projected_soc, 2)
+            self._last_coulomb_time = now_s
+
         return ordered
 
     def get_latest_telemetry(self) -> Optional[Dict[str, Any]]:
         """
         Retorna telemetría en tiempo real cada 1.0s de forma 100% no bloqueante,
-        manteniendo el voltaje y el SOC exactos del inversor sin ruido artificial.
+        avanzando suavemente con integración coulométrica y anclándose a cada lectura BMS.
         """
         with self._lock:
             base = dict(self._base_telemetry) if self._base_telemetry else None
@@ -394,16 +459,12 @@ class SmartESSCloudClient:
                 return None
 
         now = time.time()
-        self._last_tick_time = now
-
         base_pv = float(base.get("pv_power_w", 0.0))
         base_load = float(base.get("load_power_w", 0.0))
-        base_v = float(base.get("battery_voltage", 52.4))
+        base_v = float(base.get("battery_voltage", 52.0))
         base_net_batt = float(base.get("battery_power_w", 0.0))
-        base_soc = float(base.get("battery_soc", 70.0))
 
-        # Micro-oscilación realista únicamente en potencias instantáneas (W),
-        # NUNCA en el voltaje ni en el SOC de la batería para evitar fluctuaciones falsas.
+        # Micro-oscilación realista únicamente en potencias instantáneas (W)
         phase = now * 1.7
         if base_pv > 5.0:
             pv_jitter = math.sin(phase) * max(1.0, base_pv * 0.005) + random.uniform(-0.5, 0.5)
@@ -419,9 +480,12 @@ class SmartESSCloudClient:
 
         live_net_batt = round(base_net_batt + (live_pv - base_pv) - (live_load - base_load), 1)
 
+        with self._lock:
+            live_soc = round(self._filtered_soc if self._filtered_soc is not None else float(base.get("battery_soc", 50.0)), 1)
+
         base["pv_power_w"] = live_pv
         base["load_power_w"] = live_load
         base["battery_power_w"] = live_net_batt
-        base["battery_soc"] = round(base_soc, 1)
+        base["battery_soc"] = live_soc
         base["battery_voltage"] = round(base_v, 2)
         return base

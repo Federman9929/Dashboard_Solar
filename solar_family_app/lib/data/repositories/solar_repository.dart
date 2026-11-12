@@ -117,7 +117,8 @@ class SolarRepository {
     });
 
     // Escuchar lote de historial de 24h publicado por la MacBook
-    // Garantiza inmutabilidad del pasado: nunca altera puntos históricos ya consolidados.
+    // El backend ya envía puntos anclados a cubetas fijas de tiempo (epoch_ms // 180000)
+    // y calibrados con las lecturas reales del BMS.
     _mqttService.historyStream.listen((pointsList) {
       if (_demoMode) return;
       final parsed = pointsList
@@ -125,29 +126,9 @@ class SolarRepository {
           .toList(growable: false);
       if (parsed.isEmpty) return;
 
-      final hasOnlySynthetic = _history24h.isNotEmpty &&
-          _history24h.every((r) => r.sourceMode == 'HISTORIAL');
-
-      if (_history24h.isEmpty || hasOnlySynthetic) {
-        _history24h
-          ..clear()
-          ..addAll(parsed);
-      } else {
-        final firstExistingMs = _history24h.first.epochMs;
-        final lastExistingMs = _history24h.last.epochMs;
-        final olderPoints = parsed
-            .where((p) => p.epochMs < firstExistingMs)
-            .toList(growable: false);
-        final newerPoints = parsed
-            .where((p) => p.epochMs > lastExistingMs + 10000)
-            .toList(growable: false);
-        if (olderPoints.isNotEmpty) {
-          _history24h.insertAll(0, olderPoints);
-        }
-        if (newerPoints.isNotEmpty) {
-          _history24h.addAll(newerPoints);
-        }
-      }
+      _history24h
+        ..clear()
+        ..addAll(parsed);
       _history24hController.add(List.unmodifiable(_history24h));
     });
 
@@ -191,6 +172,10 @@ class SolarRepository {
         effectiveSoc = double.parse(
           (_lastSmoothedSoc! * 0.80 + effectiveSoc * 0.20).toStringAsFixed(1),
         );
+      } else {
+        // Si hubo una recalibración de ancla BMS mayor a 2.5%, limpiar ventana de 1s previa
+        // para que no quede un escalón artificial en la gráfica de 1m/10m.
+        _realtimeReadings.clear();
       }
     }
     _lastSmoothedSoc = effectiveSoc;
