@@ -1,5 +1,5 @@
-// Prueba básica de modelo de telemetría solar
 import 'package:flutter_test/flutter_test.dart';
+import 'package:solar_family_monitor/domain/models/battery_alert_mode.dart';
 import 'package:solar_family_monitor/domain/models/solar_reading.dart';
 
 void main() {
@@ -21,5 +21,12 @@ void main() {
     expect(reading.batterySoc, 85.0);
     expect(reading.isHealthyGreen, isTrue);
     expect(reading.statusEmoji, '🟢');
+  });
+
+  test('BatteryAlertMode parsea correctamente código de modo', () {
+    expect(BatteryAlertMode.fromCode('alarm'), BatteryAlertMode.immediateAlarm);
+    expect(BatteryAlertMode.fromCode('simple'), BatteryAlertMode.simpleNotification);
+    expect(BatteryAlertMode.fromCode(null), BatteryAlertMode.simpleNotification);
+    expect(BatteryAlertMode.fromCode('other'), BatteryAlertMode.simpleNotification);
   });
 }

@@ -3,6 +3,7 @@ import 'dart:math' as math;
 
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../../domain/models/battery_alert_mode.dart';
 import '../../domain/models/solar_reading.dart';
 import '../services/mqtt_solar_service.dart';
 import '../services/notification_alert_service.dart';
@@ -27,6 +28,7 @@ class SolarRepository {
   static const String _prefTelegramChatId = 'telegram_chat_id';
   static const String _prefDemoMode = 'demo_mode_enabled';
   static const String _prefCriticalThreshold = 'critical_soc_threshold';
+  static const String _prefAlertMode = 'battery_alert_mode';
 
   String _brokerHost = '192.168.0.224';
   int _brokerPort = 1883;
@@ -34,6 +36,7 @@ class SolarRepository {
   String _telegramChatId = '';
   bool _demoMode = false;
   double _criticalSocThreshold = 30.0;
+  BatteryAlertMode _alertMode = BatteryAlertMode.simpleNotification;
   Timer? _demoTimer;
 
   String get brokerHost => _brokerHost;
@@ -42,6 +45,8 @@ class SolarRepository {
   String get telegramChatId => _telegramChatId;
   bool get demoMode => _demoMode;
   double get criticalSocThreshold => _criticalSocThreshold;
+  BatteryAlertMode get alertMode => _alertMode;
+  bool get isAlarmRinging => _notificationService.isRinging;
 
   Stream<MqttConnectionStateStatus> get connectionStream =>
       _mqttService.connectionStream;
@@ -102,6 +107,7 @@ class SolarRepository {
     _telegramChatId = prefs.getString(_prefTelegramChatId) ?? '';
     _demoMode = prefs.getBool(_prefDemoMode) ?? false;
     _criticalSocThreshold = prefs.getDouble(_prefCriticalThreshold) ?? 30.0;
+    _alertMode = BatteryAlertMode.fromCode(prefs.getString(_prefAlertMode));
 
     // Solo pre-cargar curva sintética si el usuario activó explícitamente el modo Demo
     if (_demoMode) {
@@ -237,10 +243,21 @@ class SolarRepository {
     _notificationService.triggerCriticalBatteryAlert(
       reading: reading,
       threshold: _criticalSocThreshold,
+      alertMode: _alertMode,
       telegramBotToken: _telegramBotToken,
       telegramChatId: _telegramChatId,
       force: force,
     );
+  }
+
+  Future<void> updateAlertMode(BatteryAlertMode mode) async {
+    _alertMode = mode;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_prefAlertMode, mode.code);
+    if (mode == BatteryAlertMode.simpleNotification &&
+        _notificationService.isRinging) {
+      await silenceCriticalAlert();
+    }
   }
 
   Future<void> silenceCriticalAlert() async {
@@ -305,6 +322,7 @@ class SolarRepository {
     required String telegramChatId,
     required bool demoMode,
     double? criticalThreshold,
+    BatteryAlertMode? alertMode,
   }) async {
     _brokerHost = host.trim();
     _brokerPort = port;
@@ -314,6 +332,9 @@ class SolarRepository {
     if (criticalThreshold != null) {
       _criticalSocThreshold = criticalThreshold.clamp(5.0, 95.0);
     }
+    if (alertMode != null) {
+      _alertMode = alertMode;
+    }
 
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_prefBrokerHost, _brokerHost);
@@ -322,6 +343,7 @@ class SolarRepository {
     await prefs.setString(_prefTelegramChatId, _telegramChatId);
     await prefs.setBool(_prefDemoMode, _demoMode);
     await prefs.setDouble(_prefCriticalThreshold, _criticalSocThreshold);
+    await prefs.setString(_prefAlertMode, _alertMode.code);
 
     _mqttService.sendCommand(
       'SET_THRESHOLD:${_criticalSocThreshold.toStringAsFixed(1)}',
@@ -368,8 +390,8 @@ class SolarRepository {
         SolarReading(
           timestamp: dt,
           epochMs: ts,
-          batteryVoltage: 56.6,
-          batterySoc: 100.0,
+          batteryVoltage: double.parse(voltage.toStringAsFixed(2)),
+          batterySoc: double.parse(soc.toStringAsFixed(1)),
           pvPowerW: double.parse(pv.toStringAsFixed(1)),
           batteryPowerW: double.parse(netBatt.toStringAsFixed(1)),
           batteryChargeW: double.parse(chargeW.toStringAsFixed(1)),

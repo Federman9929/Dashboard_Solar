@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart';
 
 import 'package:solar_family_monitor/data/repositories/solar_repository.dart';
 import 'package:solar_family_monitor/data/services/mqtt_solar_service.dart';
+import 'package:solar_family_monitor/domain/models/battery_alert_mode.dart';
 import 'package:solar_family_monitor/domain/models/solar_reading.dart';
 
 class SolarDashboardViewModel extends ChangeNotifier {
@@ -44,6 +45,8 @@ class SolarDashboardViewModel extends ChangeNotifier {
   String get telegramChatId => _repository.telegramChatId;
   bool get demoMode => _repository.demoMode;
   double get criticalSocThreshold => _repository.criticalSocThreshold;
+  BatteryAlertMode get alertMode => _repository.alertMode;
+  bool get isAlarmRinging => _repository.isAlarmRinging;
 
   final List<StreamSubscription<dynamic>> _subscriptions = [];
 
@@ -124,6 +127,11 @@ class SolarDashboardViewModel extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> updateAlertMode(BatteryAlertMode mode) async {
+    await _repository.updateAlertMode(mode);
+    notifyListeners();
+  }
+
   Future<void> saveSettings({
     required String host,
     required int port,
@@ -131,6 +139,7 @@ class SolarDashboardViewModel extends ChangeNotifier {
     required String telegramChatId,
     required bool demoMode,
     double? criticalThreshold,
+    BatteryAlertMode? alertMode,
   }) async {
     await _repository.updateSettings(
       host: host,
@@ -139,6 +148,7 @@ class SolarDashboardViewModel extends ChangeNotifier {
       telegramChatId: telegramChatId,
       demoMode: demoMode,
       criticalThreshold: criticalThreshold,
+      alertMode: alertMode,
     );
     notifyListeners();
   }
