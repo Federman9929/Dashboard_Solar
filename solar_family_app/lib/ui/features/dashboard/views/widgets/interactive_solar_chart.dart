@@ -12,12 +12,14 @@ class ChartTimeRangePreset {
     required this.fullLabel,
     required this.duration,
     required this.showSeconds,
+    required this.bucketMs,
   });
 
   final String shortLabel;
   final String fullLabel;
   final Duration duration;
   final bool showSeconds;
+  final int bucketMs;
 }
 
 const List<ChartTimeRangePreset> kChartTimeRangePresets = [
@@ -26,42 +28,60 @@ const List<ChartTimeRangePreset> kChartTimeRangePresets = [
     fullLabel: '1 minuto',
     duration: Duration(minutes: 1),
     showSeconds: true,
+    bucketMs: 1000, // 1s por cubeta fija
   ),
   ChartTimeRangePreset(
     shortLabel: '10m',
     fullLabel: '10 minutos',
     duration: Duration(minutes: 10),
     showSeconds: true,
+    bucketMs: 10000, // 10s por cubeta fija
   ),
   ChartTimeRangePreset(
     shortLabel: '30m',
     fullLabel: '30 minutos',
     duration: Duration(minutes: 30),
     showSeconds: false,
+    bucketMs: 30000, // 30s por cubeta fija
   ),
   ChartTimeRangePreset(
     shortLabel: '1h',
     fullLabel: '1 hora',
     duration: Duration(hours: 1),
     showSeconds: false,
+    bucketMs: 60000, // 1 min por cubeta fija
   ),
   ChartTimeRangePreset(
     shortLabel: '6h',
     fullLabel: '6 horas',
     duration: Duration(hours: 6),
     showSeconds: false,
+    bucketMs: 300000, // 5 min por cubeta fija
   ),
   ChartTimeRangePreset(
     shortLabel: '24h',
     fullLabel: '24 horas',
     duration: Duration(hours: 24),
     showSeconds: false,
+    bucketMs: 900000, // 15 min por cubeta fija
   ),
 ];
 
-/// Gráfica Dinámica e Interactiva basada en `fl_chart`.
-/// Incluye selector y deslizador de rango de tiempo:
-/// 1 minuto, 10 minutos, 30 minutos, 1 hora, 6 horas y 24 horas.
+class _ChartBucketPoint {
+  const _ChartBucketPoint({
+    required this.reading,
+    required this.smoothedY,
+  });
+
+  final SolarReading reading;
+  final double smoothedY;
+}
+
+/// Gráfica Dinámica, Suave e Inmutable basada en `fl_chart`.
+/// - Ancla las muestras a cubetas fijas de tiempo (`epochMs ~/ bucketMs`)
+///   para que los registros del pasado jamás cambien ni bailen cuando entra
+///   una nueva lectura cada segundo.
+/// - Aplica suavizado causal + splines con `preventCurveOverShooting: true`.
 class InteractiveSolarChart extends StatefulWidget {
   const InteractiveSolarChart({
     super.key,
@@ -116,16 +136,15 @@ class _InteractiveSolarChartState extends State<InteractiveSolarChart> {
     });
   }
 
-  List<SolarReading> _filterAndDownsample(
+  List<_ChartBucketPoint> _buildImmutableSmoothSeries(
     List<SolarReading> allPoints,
-    Duration windowDuration,
+    ChartTimeRangePreset preset,
   ) {
     if (allPoints.isEmpty) return const [];
 
     final latestMs = allPoints.last.epochMs;
-    final cutoffMs = latestMs - windowDuration.inMilliseconds;
+    final cutoffMs = latestMs - preset.duration.inMilliseconds;
 
-    // Filtrar puntos dentro de la ventana de tiempo seleccionada
     final filtered = <SolarReading>[];
     SolarReading? lastBeforeCutoff;
 
@@ -137,11 +156,9 @@ class _InteractiveSolarChartState extends State<InteractiveSolarChart> {
       }
     }
 
-    // Si hay un punto previo al inicio de la ventana, anclarlo al inicio para continuidad visual
     if (lastBeforeCutoff != null &&
         (filtered.isEmpty ||
-            (filtered.first.epochMs - cutoffMs) >
-                windowDuration.inMilliseconds * 0.15)) {
+            (filtered.first.epochMs - cutoffMs) > preset.bucketMs)) {
       filtered.insert(
         0,
         SolarReading(
@@ -161,24 +178,95 @@ class _InteractiveSolarChartState extends State<InteractiveSolarChart> {
       );
     }
 
-    if (filtered.length < 2 && allPoints.length >= 2) {
-      return allPoints.sublist(math.max(0, allPoints.length - 10));
+    if (filtered.isEmpty) {
+      final last = allPoints.last;
+      final val = widget.valueSelector(last);
+      return [
+        _ChartBucketPoint(reading: last, smoothedY: val),
+      ];
     }
 
-    // Limitar a máximo 90 puntos visuales para mantener 60 FPS sin calentar el celular
-    const maxVisualPoints = 90;
-    if (filtered.length <= maxVisualPoints) {
-      return filtered;
+    // Agrupar por cubeta fija de tiempo (`epochMs ~/ bucketMs`).
+    // Cada cubeta histórica cerrada tiene SIEMPRE el mismo ID y los mismos puntos,
+    // por lo que jamás se modifica cuando llegan nuevas lecturas en el presente.
+    final bucketMs = preset.bucketMs;
+    final bucketReadings = <SolarReading>[];
+    final bucketRawY = <double>[];
+
+    int? currentBucketId;
+    double sumY = 0.0;
+    int countInBucket = 0;
+    SolarReading? representative;
+
+    for (final r in filtered) {
+      final bId = r.epochMs ~/ bucketMs;
+      final y = widget.valueSelector(r);
+      if (currentBucketId == null || bId != currentBucketId) {
+        if (representative != null && countInBucket > 0) {
+          bucketReadings.add(representative);
+          bucketRawY.add(sumY / countInBucket);
+        }
+        currentBucketId = bId;
+        sumY = y;
+        countInBucket = 1;
+        representative = r;
+      } else {
+        sumY += y;
+        countInBucket++;
+        representative = r;
+      }
+    }
+    if (representative != null && countInBucket > 0) {
+      bucketReadings.add(representative);
+      bucketRawY.add(sumY / countInBucket);
     }
 
-    final step = filtered.length / maxVisualPoints;
-    final downsampled = <SolarReading>[];
-    for (int i = 0; i < maxVisualPoints - 1; i++) {
-      final idx = (i * step).floor().clamp(0, filtered.length - 1);
-      downsampled.add(filtered[idx]);
+    // Si solo hay 1 punto en la ventana (ej. recién abierta la app en modo 1m),
+    // anclar el inicio de la ventana con el mismo nivel para dibujar una línea limpia
+    if (bucketReadings.length == 1) {
+      final only = bucketReadings.first;
+      final anchor = SolarReading(
+        timestamp: DateTime.fromMillisecondsSinceEpoch(cutoffMs),
+        epochMs: cutoffMs,
+        batteryVoltage: only.batteryVoltage,
+        batterySoc: only.batterySoc,
+        pvPowerW: only.pvPowerW,
+        batteryPowerW: only.batteryPowerW,
+        batteryChargeW: only.batteryChargeW,
+        batteryDischargeW: only.batteryDischargeW,
+        loadPowerW: only.loadPowerW,
+        status: only.status,
+        isCritical: only.isCritical,
+        sourceMode: only.sourceMode,
+      );
+      bucketReadings.insert(0, anchor);
+      bucketRawY.insert(0, bucketRawY.first);
     }
-    downsampled.add(filtered.last);
-    return downsampled;
+
+    // Filtro causal de media móvil ponderada (3 puntos hacia atrás):
+    // Suaviza la curva sin usar puntos futuros, garantizando que ningún punto
+    // pasado cambie su valor cuando se añade un punto nuevo a la derecha.
+    final result = <_ChartBucketPoint>[];
+    for (int i = 0; i < bucketReadings.length; i++) {
+      double smoothY;
+      if (i == 0) {
+        smoothY = bucketRawY[0];
+      } else if (i == 1) {
+        smoothY = bucketRawY[0] * 0.35 + bucketRawY[1] * 0.65;
+      } else {
+        smoothY = bucketRawY[i - 2] * 0.20 +
+            bucketRawY[i - 1] * 0.35 +
+            bucketRawY[i] * 0.45;
+      }
+      result.add(
+        _ChartBucketPoint(
+          reading: bucketReadings[i],
+          smoothedY: double.parse(smoothY.toStringAsFixed(1)),
+        ),
+      );
+    }
+
+    return result;
   }
 
   @override
@@ -192,26 +280,38 @@ class _InteractiveSolarChartState extends State<InteractiveSolarChart> {
     }
 
     final preset = kChartTimeRangePresets[_selectedRangeIndex];
-    final visibleReadings = _filterAndDownsample(allPoints, preset.duration);
+    final series = _buildImmutableSmoothSeries(allPoints, preset);
+
+    final firstEpochMs = series.first.reading.epochMs;
+    final lastEpochMs = math.max(
+      firstEpochMs + 1000,
+      series.last.reading.epochMs,
+    );
 
     final spots = <FlSpot>[];
     double computedMinY = widget.minY ?? double.infinity;
     double computedMaxY = widget.maxY ?? double.negativeInfinity;
 
-    for (int i = 0; i < visibleReadings.length; i++) {
-      final yVal = widget.valueSelector(visibleReadings[i]);
-      spots.add(FlSpot(i.toDouble(), yVal));
+    for (int i = 0; i < series.length; i++) {
+      final pt = series[i];
+      // Usar coordenada X basada en el tiempo real (segundos desde el inicio de la ventana)
+      // para que cada punto histórico conserve su posición temporal real.
+      final xSec = (pt.reading.epochMs - firstEpochMs) / 1000.0;
+      final yVal = pt.smoothedY;
+      spots.add(FlSpot(xSec, yVal));
       if (widget.minY == null && yVal < computedMinY) computedMinY = yVal;
       if (widget.maxY == null && yVal > computedMaxY) computedMaxY = yVal;
     }
 
     if (computedMinY == double.infinity) computedMinY = 0;
-    if (computedMaxY == double.negativeInfinity || computedMaxY <= computedMinY) {
+    if (computedMaxY == double.negativeInfinity ||
+        computedMaxY <= computedMinY) {
       computedMaxY = computedMinY + 100;
     }
 
     final effectiveMinY = widget.minY ?? math.max(0.0, computedMinY * 0.88);
     final effectiveMaxY = widget.maxY ?? (computedMaxY * 1.15 + 15.0);
+    final maxXSec = math.max(1.0, (lastEpochMs - firstEpochMs) / 1000.0);
 
     final timeFormatter = preset.showSeconds
         ? DateFormat('HH:mm:ss')
@@ -287,9 +387,8 @@ class _InteractiveSolarChartState extends State<InteractiveSolarChart> {
                             : const Color(0xFF0D131F),
                         borderRadius: BorderRadius.circular(10),
                         border: Border.all(
-                          color: isSelected
-                              ? widget.lineColor
-                              : Colors.white12,
+                          color:
+                              isSelected ? widget.lineColor : Colors.white12,
                           width: isSelected ? 1.3 : 1.0,
                         ),
                       ),
@@ -312,7 +411,7 @@ class _InteractiveSolarChartState extends State<InteractiveSolarChart> {
           const SizedBox(height: 10),
 
           // Píldora informativa del punto exacto inspeccionado o último valor
-          _buildInspectedPointBanner(visibleReadings.last, timeFormatter),
+          _buildInspectedPointBanner(series.last.reading, timeFormatter),
 
           const SizedBox(height: 14),
 
@@ -321,7 +420,7 @@ class _InteractiveSolarChartState extends State<InteractiveSolarChart> {
             child: LineChart(
               LineChartData(
                 minX: 0,
-                maxX: math.max(1, visibleReadings.length - 1).toDouble(),
+                maxX: maxXSec,
                 minY: effectiveMinY,
                 maxY: effectiveMaxY,
                 clipData: const FlClipData.all(),
@@ -368,16 +467,15 @@ class _InteractiveSolarChartState extends State<InteractiveSolarChart> {
                     sideTitles: SideTitles(
                       showTitles: true,
                       reservedSize: 26,
-                      interval: math.max(
-                        1.0,
-                        (visibleReadings.length / 3.5).floorToDouble(),
-                      ),
+                      interval: math.max(1.0, maxXSec / 3.5),
                       getTitlesWidget: (value, meta) {
-                        final idx = value.round();
-                        if (idx < 0 || idx >= visibleReadings.length) {
+                        if (value < 0 || value > maxXSec) {
                           return const SizedBox.shrink();
                         }
-                        final dt = visibleReadings[idx].timestamp;
+                        final epochAtTick =
+                            firstEpochMs + (value * 1000.0).round();
+                        final dt =
+                            DateTime.fromMillisecondsSinceEpoch(epochAtTick);
                         return Padding(
                           padding: const EdgeInsets.only(top: 6),
                           child: Text(
@@ -427,11 +525,11 @@ class _InteractiveSolarChartState extends State<InteractiveSolarChart> {
                       (FlTouchEvent event, LineTouchResponse? response) {
                     if (response?.lineBarSpots != null &&
                         response!.lineBarSpots!.isNotEmpty) {
-                      final spotIdx =
-                          response.lineBarSpots!.first.x.round();
-                      if (spotIdx >= 0 && spotIdx < visibleReadings.length) {
+                      final spotIndex =
+                          response.lineBarSpots!.first.spotIndex;
+                      if (spotIndex >= 0 && spotIndex < series.length) {
                         setState(() {
-                          _selectedReading = visibleReadings[spotIdx];
+                          _selectedReading = series[spotIndex].reading;
                         });
                       }
                     }
@@ -465,15 +563,14 @@ class _InteractiveSolarChartState extends State<InteractiveSolarChart> {
                     tooltipBorder: BorderSide(color: widget.lineColor),
                     getTooltipItems: (List<LineBarSpot> touchedSpots) {
                       return touchedSpots.map((barSpot) {
-                        final idx = barSpot.x.round();
-                        final reading =
-                            (idx >= 0 && idx < visibleReadings.length)
-                                ? visibleReadings[idx]
-                                : visibleReadings.last;
+                        final idx = barSpot.spotIndex;
+                        final pt = (idx >= 0 && idx < series.length)
+                            ? series[idx]
+                            : series.last;
+                        final reading = pt.reading;
                         final exactTime =
                             timeFormatter.format(reading.timestamp);
-                        final exactVal =
-                            widget.valueSelector(reading).toStringAsFixed(1);
+                        final exactVal = pt.smoothedY.toStringAsFixed(1);
                         return LineTooltipItem(
                           '$exactVal ${widget.unit}\n',
                           TextStyle(
@@ -509,13 +606,12 @@ class _InteractiveSolarChartState extends State<InteractiveSolarChart> {
                   LineChartBarData(
                     spots: spots,
                     isCurved: true,
-                    curveSmoothness: 0.22,
+                    curveSmoothness: 0.32,
+                    preventCurveOverShooting: true,
                     color: widget.lineColor,
-                    barWidth: 2.8,
+                    barWidth: 3.0,
                     isStrokeCapRound: true,
-                    dotData: FlDotData(
-                      show: visibleReadings.length <= 20,
-                    ),
+                    dotData: const FlDotData(show: false),
                     belowBarData: BarAreaData(
                       show: true,
                       gradient: LinearGradient(
@@ -530,7 +626,7 @@ class _InteractiveSolarChartState extends State<InteractiveSolarChart> {
                   ),
                 ],
               ),
-              duration: Duration.zero, // Evita animaciones pesadas cada segundo
+              duration: Duration.zero,
             ),
           ),
 
@@ -596,9 +692,8 @@ class _InteractiveSolarChartState extends State<InteractiveSolarChart> {
         color: const Color(0xFF0D131F),
         borderRadius: BorderRadius.circular(12),
         border: Border.all(
-          color: isSelected
-              ? widget.lineColor.withOpacity(0.6)
-              : Colors.white10,
+          color:
+              isSelected ? widget.lineColor.withOpacity(0.6) : Colors.white10,
         ),
       ),
       child: Row(

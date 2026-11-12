@@ -70,14 +70,14 @@ class SolarRepository {
 
   final List<SolarReading> _history24h = [];
   final List<SolarReading> _realtimeReadings = [];
+  double? _lastSmoothedSoc;
 
   List<SolarReading> get history24h => List.unmodifiable(_history24h);
   List<SolarReading> get realtimeReadings =>
       List.unmodifiable(_realtimeReadings);
 
-  /// Línea de tiempo unificada que combina el historial de 24h con la ventana
-  /// de alta resolución (1s) para poder consultar desde 1 minuto hasta 24 horas
-  /// en cualquiera de las 3 gráficas (Batería, PV y Carga de la Casa).
+  /// Línea de tiempo unificada e inmutable hacia el pasado que combina el
+  /// historial de 24h con la ventana de alta resolución (1s).
   List<SolarReading> get unifiedTimeline {
     if (_realtimeReadings.isEmpty) return List.unmodifiable(_history24h);
     if (_history24h.isEmpty) return List.unmodifiable(_realtimeReadings);
@@ -92,14 +92,6 @@ class SolarRepository {
   }
 
   Future<void> initialize() async {
-    // Pre-cargar curva inicial de 24h de inmediato para renderizar las gráficas al instante
-    _seedInitialHistoryIfNeeded();
-    _history24hController.add(List.unmodifiable(_history24h));
-    _realtimeWindowController.add(List.unmodifiable(_realtimeReadings));
-    if (_realtimeReadings.isNotEmpty) {
-      _readingStreamController.add(_realtimeReadings.last);
-    }
-
     // Inicializar notificaciones sin bloquear si el usuario tarda en aceptar el diálogo de permisos
     unawaited(_notificationService.initialize());
 
@@ -111,6 +103,12 @@ class SolarRepository {
     _demoMode = prefs.getBool(_prefDemoMode) ?? false;
     _criticalSocThreshold = prefs.getDouble(_prefCriticalThreshold) ?? 30.0;
 
+    // Solo pre-cargar curva sintética si el usuario activó explícitamente el modo Demo
+    if (_demoMode) {
+      _seedInitialHistoryIfNeeded();
+      _history24hController.add(List.unmodifiable(_history24h));
+    }
+
     // Escuchar telemetría MQTT en tiempo real (cada 1-2s)
     _mqttService.telemetryStream.listen((jsonMap) {
       if (_demoMode) return;
@@ -119,17 +117,38 @@ class SolarRepository {
     });
 
     // Escuchar lote de historial de 24h publicado por la MacBook
+    // Garantiza inmutabilidad del pasado: nunca altera puntos históricos ya consolidados.
     _mqttService.historyStream.listen((pointsList) {
       if (_demoMode) return;
       final parsed = pointsList
           .map(SolarReading.fromJson)
           .toList(growable: false);
-      if (parsed.isNotEmpty) {
+      if (parsed.isEmpty) return;
+
+      final hasOnlySynthetic = _history24h.isNotEmpty &&
+          _history24h.every((r) => r.sourceMode == 'HISTORIAL');
+
+      if (_history24h.isEmpty || hasOnlySynthetic) {
         _history24h
           ..clear()
           ..addAll(parsed);
-        _history24hController.add(List.unmodifiable(_history24h));
+      } else {
+        final firstExistingMs = _history24h.first.epochMs;
+        final lastExistingMs = _history24h.last.epochMs;
+        final olderPoints = parsed
+            .where((p) => p.epochMs < firstExistingMs)
+            .toList(growable: false);
+        final newerPoints = parsed
+            .where((p) => p.epochMs > lastExistingMs + 10000)
+            .toList(growable: false);
+        if (olderPoints.isNotEmpty) {
+          _history24h.insertAll(0, olderPoints);
+        }
+        if (newerPoints.isNotEmpty) {
+          _history24h.addAll(newerPoints);
+        }
       }
+      _history24hController.add(List.unmodifiable(_history24h));
     });
 
     // Escuchar alertas críticas emitidas por el backend en la MacBook
@@ -163,14 +182,43 @@ class SolarRepository {
     }
   }
 
-  void _processIncomingReading(SolarReading reading) {
+  void _processIncomingReading(SolarReading rawReading) {
+    // Suavizado causal sobre el nuevo punto actual sin tocar jamás los puntos pasados
+    double effectiveSoc = rawReading.batterySoc;
+    if (_lastSmoothedSoc != null && rawReading.sourceMode != 'TEST_ALERTA') {
+      final diff = (effectiveSoc - _lastSmoothedSoc!).abs();
+      if (diff <= 2.5) {
+        effectiveSoc = double.parse(
+          (_lastSmoothedSoc! * 0.80 + effectiveSoc * 0.20).toStringAsFixed(1),
+        );
+      }
+    }
+    _lastSmoothedSoc = effectiveSoc;
+
+    final reading = effectiveSoc == rawReading.batterySoc
+        ? rawReading
+        : SolarReading(
+            timestamp: rawReading.timestamp,
+            epochMs: rawReading.epochMs,
+            batteryVoltage: rawReading.batteryVoltage,
+            batterySoc: effectiveSoc,
+            pvPowerW: rawReading.pvPowerW,
+            batteryPowerW: rawReading.batteryPowerW,
+            batteryChargeW: rawReading.batteryChargeW,
+            batteryDischargeW: rawReading.batteryDischargeW,
+            loadPowerW: rawReading.loadPowerW,
+            status: rawReading.status,
+            isCritical: effectiveSoc < _criticalSocThreshold,
+            sourceMode: rawReading.sourceMode,
+          );
+
     // 1. Mantener ventana en tiempo real de 10 minutos a 1s (600 puntos en RAM = <40KB)
     _realtimeReadings.add(reading);
     if (_realtimeReadings.length > 600) {
       _realtimeReadings.removeAt(0);
     }
 
-    // 2. Añadir al historial cada 15 segundos para soportar vistas de 10m, 30m, 1h, 6h y 24h
+    // 2. Añadir al historial cada 15 segundos de forma estrictamente append-only (inmutable)
     if (_history24h.isEmpty ||
         (reading.epochMs - _history24h.last.epochMs) >= 15 * 1000) {
       _history24h.add(reading);

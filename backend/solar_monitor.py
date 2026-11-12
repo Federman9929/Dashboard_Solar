@@ -96,6 +96,9 @@ class LocalHistoryDB:
                 )
                 """
             )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS db_meta (key TEXT PRIMARY KEY, val TEXT)"
+            )
             try:
                 conn.execute(
                     "ALTER TABLE telemetry_history ADD COLUMN load_power_w REAL NOT NULL DEFAULT 0.0"
@@ -105,14 +108,20 @@ class LocalHistoryDB:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_epoch_ms ON telemetry_history(epoch_ms)"
             )
-            # Limpiar registros antiguos con voltaje inválido (40.0V / 75.0% del endpoint anterior)
-            conn.execute(
-                "DELETE FROM telemetry_history WHERE battery_voltage <= 41.0"
+            # Limpiar una única vez registros antiguos descalibrados (ej. 85% / 97% en noche o 40V)
+            meta_cur = conn.execute(
+                "SELECT val FROM db_meta WHERE key = 'soc_calibration_v4'"
             )
+            if meta_cur.fetchone() is None:
+                conn.execute("DELETE FROM telemetry_history")
+                conn.execute(
+                    "INSERT OR REPLACE INTO db_meta (key, val) VALUES ('soc_calibration_v4', '1')"
+                )
             conn.commit()
             cursor = conn.execute("SELECT COUNT(*) FROM telemetry_history")
             count = cursor.fetchone()[0]
-            if count == 0:
+            mode = os.getenv("CONNECTION_MODE", "SIMULATOR").upper()
+            if count == 0 and mode != "SMARTESS_CLOUD":
                 logger.info("Inicializando base de datos con curva histórica base de 24h...")
                 self._seed_24h_history(conn)
 
@@ -162,9 +171,10 @@ class LocalHistoryDB:
 
     def insert_sample(self, sample: SolarTelemetry) -> None:
         with sqlite3.connect(self.db_path) as conn:
+            # INSERT OR IGNORE garantiza que los registros históricos pasados sean 100% inmutables
             conn.execute(
                 """
-                INSERT OR REPLACE INTO telemetry_history
+                INSERT OR IGNORE INTO telemetry_history
                 (epoch_ms, battery_voltage, battery_soc, pv_power_w, battery_power_w, battery_discharge_w, status, load_power_w)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
@@ -201,11 +211,10 @@ class LocalHistoryDB:
             for p in points
         ]
         with sqlite3.connect(self.db_path) as conn:
-            # Reemplazar historial previo con la curva real recalibrada de 24h del inversor
-            conn.execute("DELETE FROM telemetry_history")
+            # INSERT OR IGNORE evita sobrescribir o alterar muestras históricas ya consolidadas
             conn.executemany(
                 """
-                INSERT OR REPLACE INTO telemetry_history
+                INSERT OR IGNORE INTO telemetry_history
                 (epoch_ms, battery_voltage, battery_soc, pv_power_w, battery_power_w, battery_discharge_w, status, load_power_w)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
@@ -214,8 +223,15 @@ class LocalHistoryDB:
             conn.commit()
 
     def get_last_24h_downsampled(self, max_points: int = 500) -> List[Dict]:
-        """Devuelve hasta `max_points` muestras de las últimas 24 horas para gráficas ágiles."""
-        cutoff_ms = int(time.time() * 1000) - (24 * 3600 * 1000)
+        """
+        Devuelve el historial de las últimas 24 horas usando cubetas de tiempo fijas
+        (ancladas a epoch_ms) en lugar de salto de índices (`rows[::step]`).
+        Así, al insertar nuevas lecturas cada 15s, los puntos históricos del pasado
+        NUNCA cambian ni se desplazan en la gráfica.
+        """
+        now_ms = int(time.time() * 1000)
+        cutoff_ms = now_ms - (24 * 3600 * 1000)
+        recent_high_res_cutoff = now_ms - (60 * 60 * 1000)  # Última hora a resolución completa
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
                 """
@@ -231,8 +247,21 @@ class LocalHistoryDB:
         if not rows:
             return []
 
-        step = max(1, len(rows) // max_points)
-        sampled = rows[::step]
+        # Si hay menos de max_points o estamos dentro del límite, usar cubetas fijas de 3 min (180_000 ms)
+        # para datos de más de 1 hora de antigüedad, y resolución completa para la última hora.
+        bucket_ms = 180_000
+        seen_buckets = set()
+        sampled = []
+        for r in rows:
+            ts = r[0]
+            if ts >= recent_high_res_cutoff:
+                sampled.append(r)
+            else:
+                b_id = ts // bucket_ms
+                if b_id not in seen_buckets:
+                    seen_buckets.add(b_id)
+                    sampled.append(r)
+
         if rows[-1] != sampled[-1]:
             sampled.append(rows[-1])
 
