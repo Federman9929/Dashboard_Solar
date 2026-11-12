@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:share_plus/share_plus.dart';
 
 import 'package:solar_family_monitor/domain/models/solar_energy_stats.dart';
@@ -27,7 +28,7 @@ class _SolarReportsViewState extends State<SolarReportsView> {
 
   String _formatCop(double value) {
     final int rounded = value.round();
-    final String s = rounded.toString();
+    final String s = rounded.abs().toString();
     final buffer = StringBuffer();
     int count = 0;
     for (int i = s.length - 1; i >= 0; i--) {
@@ -37,42 +38,74 @@ class _SolarReportsViewState extends State<SolarReportsView> {
         buffer.write('.');
       }
     }
-    return '\$${buffer.toString().split('').reversed.join('')} COP';
+    final prefix = rounded < 0 ? '-\$' : '\$';
+    return '$prefix${buffer.toString().split('').reversed.join('')} COP';
   }
 
-  void _generateAndShareReport() {
-    final stats = widget.viewModel.energyStats;
-    final reading = widget.currentReading;
-    final autonomy = widget.viewModel.autonomyText;
-    final tariff = widget.viewModel.kwhTariffCop;
-
-    final String periodName = _periods[_reportExportPeriodIndex];
-    final SolarEnergyPeriodStats periodStat = switch (_reportExportPeriodIndex) {
+  SolarEnergyPeriodStats _periodStatsFor(int index, SolarEnergyStatsBundle stats) {
+    return switch (index) {
       0 => stats.day,
       1 => stats.week,
       2 => stats.month,
       _ => stats.day,
     };
+  }
 
-    final nowStr = DateTime.now().toString().substring(0, 16);
-    final String reportText = '''
-☀️ INFORME DE RENDIMIENTO SOLAR
-Periodo: $periodName ($nowStr)
+  String _buildReportText(int periodIndex) {
+    final stats = widget.viewModel.energyStats;
+    final reading = widget.currentReading;
+    final autonomy = widget.viewModel.autonomyText;
+    final tariff = widget.viewModel.kwhTariffCop;
+    final String periodName = _periods[periodIndex];
+    final periodStat = _periodStatsFor(periodIndex, stats);
+    final double savingsCop = periodStat.loadEnergyKwh * tariff;
+
+    final now = DateTime.now();
+    final nowStr =
+        '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')} '
+        '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}';
+
+    final startLine = (periodIndex == 0 && periodStat.solarStartTime.isNotEmpty)
+        ? '⏱️ Inicio consumo solar hoy: ${periodStat.solarStartTime}\n'
+        : '';
+
+    final batteryLine = reading != null
+        ? '🔋 Batería actual: ${reading.batterySoc.toStringAsFixed(1)}% (${reading.batteryVoltage.toStringAsFixed(1)}V)\n'
+        : '';
+
+    return '''☀️ INFORME DE RENDIMIENTO SOLAR
+Periodo: $periodName • $nowStr
 --------------------------------------
-🔋 Autonomía restante: $autonomy
-⚡ Tarifa aplicada: \$${tariff.toStringAsFixed(0)} COP/kWh
+${startLine}🏠 Consumo casa atendido: ${periodStat.loadEnergyKwh.toStringAsFixed(2)} kWh
 🌞 Energía solar producida: ${periodStat.pvEnergyKwh.toStringAsFixed(2)} kWh
-🏠 Consumo atendido: ${periodStat.loadEnergyKwh.toStringAsFixed(2)} kWh
-💰 Ahorro económico: ${_formatCop(periodStat.savingsCop)}
+💰 Ahorro económico: ${_formatCop(savingsCop)}
+⚡ Tarifa aplicada: \$${tariff.toStringAsFixed(0)} COP/kWh
 🌿 Cobertura solar: ${periodStat.solarCoveragePercent.toStringAsFixed(1)}%
-${reading != null ? '🔋 Nivel actual de batería: ${reading.batterySoc.toStringAsFixed(1)}% (${reading.batteryVoltage.toStringAsFixed(1)}V)' : ''}
+${batteryLine}⏳ Autonomía: $autonomy
 --------------------------------------
-Generado por Monitor Solar Familiar
-''';
+Monitor Solar Familiar''';
+  }
 
-    Share.share(
-      reportText,
-      subject: 'Informe Solar Familiar - $periodName',
+  Future<void> _shareReport(int periodIndex) async {
+    final String periodName = _periods[periodIndex];
+    final String reportText = _buildReportText(periodIndex);
+    await SharePlus.instance.share(
+      ShareParams(
+        text: reportText,
+        subject: 'Informe Solar Familiar - $periodName',
+      ),
+    );
+  }
+
+  Future<void> _copyReport(BuildContext context, int periodIndex) async {
+    final String reportText = _buildReportText(periodIndex);
+    await Clipboard.setData(ClipboardData(text: reportText));
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Informe copiado al portapapeles'),
+        duration: Duration(seconds: 2),
+      ),
     );
   }
 
@@ -83,12 +116,11 @@ Generado por Monitor Solar Familiar
     final autonomy = widget.viewModel.autonomyText;
     final tariff = widget.viewModel.kwhTariffCop;
 
-    final SolarEnergyPeriodStats activePeriodStat = switch (_selectedPeriodIndex) {
-      0 => stats.day,
-      1 => stats.week,
-      2 => stats.month,
-      _ => stats.day,
-    };
+    final activePeriodStat = _periodStatsFor(_selectedPeriodIndex, stats);
+    final double activeSavingsCop = activePeriodStat.loadEnergyKwh * tariff;
+    final reportPreviewStat = _periodStatsFor(_reportExportPeriodIndex, stats);
+    final double reportPreviewSavingsCop =
+        reportPreviewStat.loadEnergyKwh * tariff;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -99,14 +131,16 @@ Generado por Monitor Solar Familiar
           decoration: BoxDecoration(
             color: const Color(0xFF161F30),
             borderRadius: BorderRadius.circular(16),
-            border: Border.all(color: const Color(0xFFB388FF).withOpacity(0.4)),
+            border: Border.all(
+              color: const Color(0xFFB388FF).withValues(alpha: 0.4),
+            ),
           ),
           child: Row(
             children: [
               Container(
                 padding: const EdgeInsets.all(10),
                 decoration: BoxDecoration(
-                  color: const Color(0xFFB388FF).withOpacity(0.18),
+                  color: const Color(0xFFB388FF).withValues(alpha: 0.18),
                   shape: BoxShape.circle,
                 ),
                 child: const Icon(
@@ -157,13 +191,15 @@ Generado por Monitor Solar Familiar
 
         const SizedBox(height: 14),
 
-        // 2. Tarjeta de Ahorro Económico en Pesos
+        // 2. Tarjeta de Ahorro Económico en Pesos (calculado en vivo sobre consumo de la casa)
         Container(
           padding: const EdgeInsets.all(14),
           decoration: BoxDecoration(
             color: const Color(0xFF161F30),
             borderRadius: BorderRadius.circular(16),
-            border: Border.all(color: const Color(0xFF00E676).withOpacity(0.35)),
+            border: Border.all(
+              color: const Color(0xFF00E676).withValues(alpha: 0.35),
+            ),
           ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -171,8 +207,8 @@ Generado por Monitor Solar Familiar
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  Row(
-                    children: const [
+                  const Row(
+                    children: [
                       Icon(
                         Icons.savings_outlined,
                         color: Color(0xFF00E676),
@@ -243,35 +279,69 @@ Generado por Monitor Solar Familiar
 
               const SizedBox(height: 14),
 
-              // Valor del Ahorro en COP
-              Text(
-                _formatCop(activePeriodStat.savingsCop),
-                style: const TextStyle(
-                  color: Color(0xFF00E676),
-                  fontSize: 26,
-                  fontWeight: FontWeight.w900,
-                ),
-              ),
-              const SizedBox(height: 4),
+              // Valor del Ahorro en COP en tiempo real
               Row(
+                crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
-                  Text(
-                    'Generación: ${activePeriodStat.pvEnergyKwh.toStringAsFixed(2)} kWh',
-                    style: const TextStyle(
-                      color: Colors.white70,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w600,
+                  Expanded(
+                    child: Text(
+                      _formatCop(activeSavingsCop),
+                      style: const TextStyle(
+                        color: Color(0xFF00E676),
+                        fontSize: 26,
+                        fontWeight: FontWeight.w900,
+                      ),
                     ),
                   ),
-                  const SizedBox(width: 10),
+                  if (reading != null && reading.loadPowerW > 5)
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 8, vertical: 3),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF00E676).withValues(alpha: 0.14),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Text(
+                        '+${reading.loadPowerW.toStringAsFixed(0)}W en vivo',
+                        style: const TextStyle(
+                          color: Color(0xFF00E676),
+                          fontSize: 10,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 6),
+              Wrap(
+                spacing: 12,
+                runSpacing: 4,
+                children: [
                   Text(
-                    '• Cobertura: ${activePeriodStat.solarCoveragePercent.toStringAsFixed(0)}%',
+                    'Consumo: ${activePeriodStat.loadEnergyKwh.toStringAsFixed(2)} kWh',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  Text(
+                    'Solar: ${activePeriodStat.pvEnergyKwh.toStringAsFixed(2)} kWh',
                     style: const TextStyle(
                       color: Color(0xFFFFB300),
                       fontSize: 12,
                       fontWeight: FontWeight.w600,
                     ),
                   ),
+                  if (_selectedPeriodIndex == 0 &&
+                      activePeriodStat.solarStartTime.isNotEmpty)
+                    Text(
+                      'Desde ${activePeriodStat.solarStartTime}',
+                      style: const TextStyle(
+                        color: Colors.white54,
+                        fontSize: 11,
+                      ),
+                    ),
                 ],
               ),
             ],
@@ -291,8 +361,8 @@ Generado por Monitor Solar Familiar
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Row(
-                children: const [
+              const Row(
+                children: [
                   Icon(
                     Icons.description_outlined,
                     color: Color(0xFF40C4FF),
@@ -300,7 +370,7 @@ Generado por Monitor Solar Familiar
                   ),
                   SizedBox(width: 8),
                   Text(
-                    'GENERAR INFORME',
+                    'INFORME',
                     style: TextStyle(
                       color: Colors.white,
                       fontSize: 12,
@@ -342,31 +412,118 @@ Generado por Monitor Solar Familiar
                   ),
                 ],
               ),
+              const SizedBox(height: 10),
+
+              // Vista previa en vivo del informe generado
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: Colors.black26,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: Colors.white10),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _buildPreviewRow(
+                      'Consumo atendido',
+                      '${reportPreviewStat.loadEnergyKwh.toStringAsFixed(2)} kWh',
+                      Colors.white,
+                    ),
+                    _buildPreviewRow(
+                      'Energía solar producida',
+                      '${reportPreviewStat.pvEnergyKwh.toStringAsFixed(2)} kWh',
+                      const Color(0xFFFFB300),
+                    ),
+                    _buildPreviewRow(
+                      'Ahorro acumulado',
+                      _formatCop(reportPreviewSavingsCop),
+                      const Color(0xFF00E676),
+                    ),
+                    _buildPreviewRow(
+                      'Cobertura solar',
+                      '${reportPreviewStat.solarCoveragePercent.toStringAsFixed(1)}%',
+                      const Color(0xFF40C4FF),
+                    ),
+                  ],
+                ),
+              ),
+
               const SizedBox(height: 12),
 
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton.icon(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF40C4FF),
-                    foregroundColor: Colors.black,
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(10),
+              Row(
+                children: [
+                  Expanded(
+                    flex: 2,
+                    child: ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF40C4FF),
+                        foregroundColor: Colors.black,
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                      ),
+                      onPressed: () => _shareReport(_reportExportPeriodIndex),
+                      icon: const Icon(Icons.share_rounded, size: 18),
+                      label: const Text(
+                        'Generar y Compartir',
+                        style: TextStyle(
+                            fontWeight: FontWeight.w800, fontSize: 13),
+                      ),
                     ),
                   ),
-                  onPressed: _generateAndShareReport,
-                  icon: const Icon(Icons.share_rounded, size: 18),
-                  label: const Text(
-                    'Compartir Informe',
-                    style: TextStyle(fontWeight: FontWeight.w800, fontSize: 13),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: Colors.white70,
+                        side: const BorderSide(color: Colors.white24),
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                      ),
+                      onPressed: () =>
+                          _copyReport(context, _reportExportPeriodIndex),
+                      icon: const Icon(Icons.copy_rounded, size: 16),
+                      label: const Text(
+                        'Copiar',
+                        style: TextStyle(
+                            fontWeight: FontWeight.w700, fontSize: 12),
+                      ),
+                    ),
                   ),
-                ),
+                ],
               ),
             ],
           ),
         ),
       ],
+    );
+  }
+
+  Widget _buildPreviewRow(String label, String value, Color valueColor) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(
+            label,
+            style: const TextStyle(color: Colors.white60, fontSize: 11),
+          ),
+          Text(
+            value,
+            style: TextStyle(
+              color: valueColor,
+              fontSize: 12,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math' as math;
 
 import 'package:shared_preferences/shared_preferences.dart';
@@ -32,6 +33,8 @@ class SolarRepository {
   static const String _prefAlertMode = 'battery_alert_mode';
   static const String _prefKwhTariffCop = 'kwh_tariff_cop';
   static const String _prefWeeklyReportPhone = 'weekly_report_phone';
+  static const String _prefCachedStatsJson = 'cached_energy_stats_json';
+  static const String _prefCachedStatsDate = 'cached_energy_stats_date';
 
   String _brokerHost = '192.168.0.224';
   int _brokerPort = 1883;
@@ -86,6 +89,8 @@ class SolarRepository {
 
   SolarEnergyStatsBundle _currentStats = SolarEnergyStatsBundle.initial();
   SolarEnergyStatsBundle get currentStats => _currentStats;
+  int? _lastLiveStatsEpochMs;
+  int _lastStatsSaveMs = 0;
 
   final List<SolarReading> _history24h = [];
   final List<SolarReading> _realtimeReadings = [];
@@ -126,10 +131,38 @@ class SolarRepository {
     _weeklyReportPhone = prefs.getString(_prefWeeklyReportPhone) ?? '';
     _currentStats = SolarEnergyStatsBundle.initial(tariff: _kwhTariffCop);
 
+    // Restaurar estadísticas en caché para evitar mostrar $0 al abrir
+    final cachedStatsRaw = prefs.getString(_prefCachedStatsJson);
+    final cachedStatsDate = prefs.getString(_prefCachedStatsDate);
+    final todayStr = _todayDateKey();
+    if (cachedStatsRaw != null && cachedStatsRaw.isNotEmpty) {
+      try {
+        final map = jsonDecode(cachedStatsRaw) as Map<String, dynamic>;
+        final restored =
+            SolarEnergyStatsBundle.fromJson(map, isFromBackend: false)
+                .withTariff(_kwhTariffCop);
+        if (cachedStatsDate == todayStr) {
+          _currentStats = restored;
+        } else {
+          // Nuevo día: conservar acumulado semanal/mensual pero reiniciar día en 0 hasta integrar hoy
+          _currentStats = SolarEnergyStatsBundle(
+            tariffCop: _kwhTariffCop,
+            day: SolarEnergyPeriodStats.empty('Día'),
+            week: restored.week,
+            month: restored.month,
+            updatedAtMs: DateTime.now().millisecondsSinceEpoch,
+            isFromBackend: false,
+          );
+        }
+        _energyStatsController.add(_currentStats);
+      } catch (_) {}
+    }
+
     // Solo pre-cargar curva sintética si el usuario activó explícitamente el modo Demo
     if (_demoMode) {
       _seedInitialHistoryIfNeeded();
       _history24hController.add(List.unmodifiable(_history24h));
+      _bootstrapStatsFromTimelineIfNeeded();
     }
 
     // Escuchar telemetría MQTT en tiempo real (cada 1-2s)
@@ -153,6 +186,7 @@ class SolarRepository {
         ..clear()
         ..addAll(parsed);
       _history24hController.add(List.unmodifiable(_history24h));
+      _bootstrapStatsFromTimelineIfNeeded();
     });
 
     // Escuchar alertas críticas emitidas por el backend en la MacBook
@@ -179,11 +213,16 @@ class SolarRepository {
       _triggerCriticalAlertFlow(criticalReading, force: true);
     });
 
-    // Escuchar estadísticas agregadas de energía y ahorro
+    // Escuchar estadísticas agregadas de energía y ahorro enviadas por la MacBook
     _mqttService.statsStream.listen((statsJson) {
-      final bundle = SolarEnergyStatsBundle.fromJson(statsJson);
+      final bundle = SolarEnergyStatsBundle.fromJson(
+        statsJson,
+        isFromBackend: true,
+      ).withTariff(_kwhTariffCop);
       _currentStats = bundle;
+      _lastLiveStatsEpochMs = DateTime.now().millisecondsSinceEpoch;
       _energyStatsController.add(bundle);
+      unawaited(_persistStatsCache(bundle));
     });
 
     if (_demoMode) {
@@ -191,6 +230,108 @@ class SolarRepository {
     } else {
       await _mqttService.connect(host: _brokerHost, port: _brokerPort);
     }
+  }
+
+  String _todayDateKey() {
+    final now = DateTime.now();
+    return '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+  }
+
+  Future<void> _persistStatsCache(SolarEnergyStatsBundle bundle) async {
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    if ((nowMs - _lastStatsSaveMs) < 10000) return;
+    _lastStatsSaveMs = nowMs;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_prefCachedStatsJson, jsonEncode(bundle.toJson()));
+    await prefs.setString(_prefCachedStatsDate, _todayDateKey());
+  }
+
+  /// Integra el consumo acumulado del día desde el historial si aún no llega stats del backend
+  /// o como respaldo automático para evitar mostrar $0 cuando hay historial de hoy.
+  void _bootstrapStatsFromTimelineIfNeeded() {
+    if (_currentStats.isFromBackend && _currentStats.day.loadEnergyKwh > 0) {
+      return;
+    }
+    final timeline = unifiedTimeline;
+    if (timeline.length < 2) return;
+
+    final now = DateTime.now();
+    final midnightMs =
+        DateTime(now.year, now.month, now.day).millisecondsSinceEpoch;
+
+    final todayPoints = [
+      for (final p in timeline)
+        if (p.epochMs >= midnightMs) p,
+    ];
+    if (todayPoints.isEmpty) return;
+
+    double pvKwh = 0.0;
+    double loadKwh = 0.0;
+    String startTime = '';
+
+    for (int i = 0; i < todayPoints.length; i++) {
+      final cur = todayPoints[i];
+      if (startTime.isEmpty && cur.loadPowerW > 5.0) {
+        final dt = DateTime.fromMillisecondsSinceEpoch(cur.epochMs);
+        startTime =
+            '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+      }
+      if (i > 0) {
+        final prev = todayPoints[i - 1];
+        final dtS = ((cur.epochMs - prev.epochMs) / 1000.0).clamp(0.0, 900.0);
+        final dtH = dtS / 3600.0;
+        pvKwh += ((prev.pvPowerW + cur.pvPowerW) / 2.0) * dtH / 1000.0;
+        loadKwh += ((prev.loadPowerW + cur.loadPowerW) / 2.0) * dtH / 1000.0;
+      }
+    }
+
+    if (loadKwh <= _currentStats.day.loadEnergyKwh &&
+        pvKwh <= _currentStats.day.pvEnergyKwh) {
+      return;
+    }
+
+    final cov = loadKwh > 0.01
+        ? ((pvKwh / loadKwh) * 100.0).clamp(0.0, 100.0)
+        : 100.0;
+    final dayPeriod = SolarEnergyPeriodStats(
+      periodLabel: 'Día',
+      pvEnergyKwh: pvKwh,
+      loadEnergyKwh: loadKwh,
+      savingsCop: loadKwh * _kwhTariffCop,
+      solarCoveragePercent: cov,
+      solarStartTime: startTime,
+    );
+
+    final weekLoad = math.max(_currentStats.week.loadEnergyKwh, loadKwh);
+    final weekPv = math.max(_currentStats.week.pvEnergyKwh, pvKwh);
+    final monthLoad = math.max(_currentStats.month.loadEnergyKwh, loadKwh);
+    final monthPv = math.max(_currentStats.month.pvEnergyKwh, pvKwh);
+
+    _currentStats = SolarEnergyStatsBundle(
+      tariffCop: _kwhTariffCop,
+      day: dayPeriod,
+      week: SolarEnergyPeriodStats(
+        periodLabel: 'Semana',
+        pvEnergyKwh: weekPv,
+        loadEnergyKwh: weekLoad,
+        savingsCop: weekLoad * _kwhTariffCop,
+        solarCoveragePercent:
+            weekLoad > 0.01 ? ((weekPv / weekLoad) * 100.0).clamp(0, 100) : 100,
+      ),
+      month: SolarEnergyPeriodStats(
+        periodLabel: 'Mes',
+        pvEnergyKwh: monthPv,
+        loadEnergyKwh: monthLoad,
+        savingsCop: monthLoad * _kwhTariffCop,
+        solarCoveragePercent: monthLoad > 0.01
+            ? ((monthPv / monthLoad) * 100.0).clamp(0, 100)
+            : 100,
+      ),
+      updatedAtMs: DateTime.now().millisecondsSinceEpoch,
+      isFromBackend: _currentStats.isFromBackend,
+    );
+    _lastLiveStatsEpochMs = todayPoints.last.epochMs;
+    _energyStatsController.add(_currentStats);
   }
 
   void _processIncomingReading(SolarReading rawReading) {
@@ -245,6 +386,34 @@ class SolarRepository {
 
     _realtimeWindowController.add(List.unmodifiable(_realtimeReadings));
     _readingStreamController.add(reading);
+
+    // 2.5 Integrar energía y ahorro en vivo segundo a segundo (basado en carga consumida de la casa)
+    if (rawReading.sourceMode != 'TEST_ALERTA') {
+      final nowMs = reading.epochMs;
+      if (_lastLiveStatsEpochMs != null) {
+        final dtS = ((nowMs - _lastLiveStatsEpochMs!) / 1000.0).clamp(0.0, 15.0);
+        if (dtS > 0) {
+          final dtH = dtS / 3600.0;
+          final deltaPv = (reading.pvPowerW * dtH) / 1000.0;
+          final deltaLoad = (reading.loadPowerW * dtH) / 1000.0;
+          if (deltaPv > 0 || deltaLoad > 0) {
+            final dt = reading.timestamp;
+            final startIfEmpty = reading.loadPowerW > 5.0
+                ? '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}'
+                : null;
+            _currentStats = _currentStats.addLiveDelta(
+              deltaPvKwh: deltaPv,
+              deltaLoadKwh: deltaLoad,
+              tariffCop: _kwhTariffCop,
+              startTimeIfEmpty: startIfEmpty,
+            );
+            _energyStatsController.add(_currentStats);
+            unawaited(_persistStatsCache(_currentStats));
+          }
+        }
+      }
+      _lastLiveStatsEpochMs = nowMs;
+    }
 
     // 3. Actualizar Notificación Permanente (con limitador de 15s para no bloquear Android)
     _notificationService.updatePersistentNotification(
@@ -378,6 +547,12 @@ class SolarRepository {
     await prefs.setString(_prefAlertMode, _alertMode.code);
     await prefs.setDouble(_prefKwhTariffCop, _kwhTariffCop);
     await prefs.setString(_prefWeeklyReportPhone, _weeklyReportPhone);
+
+    // Actualizar inmediatamente el ahorro calculado con la nueva tarifa
+    _currentStats = _currentStats.withTariff(_kwhTariffCop);
+    _energyStatsController.add(_currentStats);
+    _lastStatsSaveMs = 0; // Permitir guardar caché de inmediato
+    unawaited(_persistStatsCache(_currentStats));
 
     _mqttService.sendCommand(
       'SET_THRESHOLD:${_criticalSocThreshold.toStringAsFixed(1)}',

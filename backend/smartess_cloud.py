@@ -77,6 +77,7 @@ class SmartESSCloudClient:
         self._last_remote_raw_ts: Optional[str] = None
         self._cached_24h_history: List[Dict[str, Any]] = []
         self._last_history_sync_time: float = 0.0
+        self.daily_cloud_totals: Dict[str, Dict[str, Any]] = {}
 
         # Sesión HTTP con Keep-Alive y Retry automático
         self.session = requests.Session()
@@ -305,16 +306,36 @@ class SmartESSCloudClient:
                 action = (
                     f"&action=queryDeviceDataOneDayPaging&source=1"
                     f"&devcode={self.devcode}&pn={self.pn}&devaddr={self.devaddr}"
-                    f"&sn={self.sn}&date={date_str}&page=0&pagesize=350&i18n=en_US"
+                    f"&sn={self.sn}&date={date_str}&page=0&pagesize=100&i18n=en_US"
                 )
                 res = self._api_get(action)
                 dat = res.get("dat", {})
                 titles = [t.get("title") for t in dat.get("title", [])]
-                rows = dat.get("row", [])
+                rows = list(dat.get("row", []))
+                total_rows = int(dat.get("total", len(rows)) or len(rows))
+                page_idx = 1
+                while len(rows) < total_rows and page_idx < 5:
+                    action_p = (
+                        f"&action=queryDeviceDataOneDayPaging&source=1"
+                        f"&devcode={self.devcode}&pn={self.pn}&devaddr={self.devaddr}"
+                        f"&sn={self.sn}&date={date_str}&page={page_idx}&pagesize=100&i18n=en_US"
+                    )
+                    res_p = self._api_get(action_p)
+                    more_rows = res_p.get("dat", {}).get("row", [])
+                    if not more_rows:
+                        break
+                    rows.extend(more_rows)
+                    page_idx += 1
+
                 if not titles or not rows:
                     continue
 
                 idx_map = {name: i for i, name in enumerate(titles)}
+                acc_pv_values: List[float] = []
+                acc_load_values: List[float] = []
+                valid_socs: List[float] = []
+                first_load_hhmm: Optional[str] = None
+
                 for row_obj in reversed(rows):
                     fields = row_obj.get("field", [])
                     if len(fields) < 17:
@@ -324,14 +345,37 @@ class SmartESSCloudClient:
                         dt_obj = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
                     except Exception:
                         continue
+
+                    if "PV Cumulative Power Generation" in idx_map and idx_map["PV Cumulative Power Generation"] < len(fields):
+                        try:
+                            val_pv = float(fields[idx_map["PV Cumulative Power Generation"]] or 0.0)
+                            if val_pv > 0:
+                                acc_pv_values.append(val_pv)
+                        except Exception:
+                            pass
+                    if "Accumulated Load Power" in idx_map and idx_map["Accumulated Load Power"] < len(fields):
+                        try:
+                            val_ld = float(fields[idx_map["Accumulated Load Power"]] or 0.0)
+                            if val_ld > 0:
+                                acc_load_values.append(val_ld)
+                        except Exception:
+                            pass
+
+                    load_w_day = float(fields[idx_map.get("PLoad", 16)] or 0.0)
+                    soc_day = float(fields[idx_map.get("SOC", 15)] or 0.0)
+                    if soc_day > 0:
+                        valid_socs.append(soc_day)
+                    if load_w_day > 5.0 and first_load_hhmm is None:
+                        first_load_hhmm = dt_obj.strftime("%H:%M")
+
                     epoch_ms = int(dt_obj.timestamp() * 1000)
                     if epoch_ms < cutoff_ms:
                         continue
 
                     batt_v = float(fields[idx_map.get("Battery Voltage", 2)] or 0.0)
                     pv_w = float(fields[idx_map.get("PV Total Charger Power", 14)] or 0.0)
-                    load_w = float(fields[idx_map.get("PLoad", 16)] or 0.0)
-                    rep_soc = float(fields[idx_map.get("SOC", 15)] or 0.0)
+                    load_w = load_w_day
+                    rep_soc = soc_day
                     raw_batt_w = (
                         float(fields[idx_map["batt power"]] or 0.0)
                         if "batt power" in idx_map and idx_map["batt power"] < len(fields)
@@ -358,6 +402,17 @@ class SmartESSCloudClient:
                         "battery_discharge_w": round(discharge_w, 1),
                         "load_power_w": round(load_w, 1),
                         "status": status,
+                    }
+
+                if acc_pv_values or acc_load_values:
+                    pv_kwh_day = round(max(0.0, acc_pv_values[-1] - acc_pv_values[0]), 2) if len(acc_pv_values) >= 2 else 0.0
+                    load_kwh_day = round(max(0.0, acc_load_values[-1] - acc_load_values[0]), 2) if len(acc_load_values) >= 2 else 0.0
+                    self.daily_cloud_totals[date_str] = {
+                        "pv_energy_kwh": pv_kwh_day,
+                        "load_energy_kwh": load_kwh_day,
+                        "min_soc": min(valid_socs) if valid_socs else 0.0,
+                        "max_soc": max(valid_socs) if valid_socs else 100.0,
+                        "solar_start_time": first_load_hhmm or "",
                     }
             except Exception as e:
                 logger.warning(f"Error descargando historial de {date_str}: {e}")

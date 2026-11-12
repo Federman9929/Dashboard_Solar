@@ -20,7 +20,7 @@ import sqlite3
 import sys
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -99,6 +99,46 @@ class LocalHistoryDB:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS db_meta (key TEXT PRIMARY KEY, val TEXT)"
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS daily_energy_stats (
+                    date_str TEXT PRIMARY KEY,
+                    pv_energy_kwh REAL NOT NULL,
+                    load_energy_kwh REAL NOT NULL,
+                    battery_min_soc REAL NOT NULL DEFAULT 0.0,
+                    battery_max_soc REAL NOT NULL DEFAULT 100.0,
+                    solar_coverage_percent REAL NOT NULL DEFAULT 100.0,
+                    savings_cop REAL NOT NULL DEFAULT 0.0,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            try:
+                conn.execute(
+                    "ALTER TABLE daily_energy_stats ADD COLUMN solar_start_time TEXT NOT NULL DEFAULT ''"
+                )
+            except sqlite3.OperationalError:
+                pass
+            # Corregir registros históricos reales verificados en SmartESS Cloud una sola vez
+            if conn.execute("SELECT val FROM db_meta WHERE key = 'daily_stats_verified_v2'").fetchone() is None:
+                now_ms = int(time.time() * 1000)
+                verified_days = [
+                    ("2026-11-08", 0.1, 0.0, 48.0, 100.0, 100.0, 0.0, now_ms, ""),
+                    ("2026-11-09", 4.1, 3.9, 45.0, 100.0, 100.0, 3315.0, now_ms, ""),
+                    ("2026-11-10", 8.9, 6.7, 40.0, 100.0, 100.0, 5695.0, now_ms, ""),
+                    ("2026-11-11", 5.3, 6.1, 33.5, 100.0, 86.9, 5185.0, now_ms, ""),
+                ]
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO daily_energy_stats
+                    (date_str, pv_energy_kwh, load_energy_kwh, battery_min_soc, battery_max_soc, solar_coverage_percent, savings_cop, updated_at, solar_start_time)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    verified_days,
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO db_meta (key, val) VALUES ('daily_stats_verified_v2', '1')"
+                )
             try:
                 conn.execute(
                     "ALTER TABLE telemetry_history ADD COLUMN load_power_w REAL NOT NULL DEFAULT 0.0"
@@ -221,28 +261,179 @@ class LocalHistoryDB:
             )
             conn.commit()
 
-    def get_energy_stats(self, tariff_cop: float = 850.0) -> Dict[str, Any]:
+    def get_meta(self, key: str, default: str = "") -> str:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute("SELECT val FROM db_meta WHERE key = ?", (key,)).fetchone()
+            return row[0] if row and row[0] is not None else default
+
+    def set_meta(self, key: str, val: str) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("INSERT OR REPLACE INTO db_meta (key, val) VALUES (?, ?)", (key, str(val)))
+            conn.commit()
+
+    def upsert_cloud_daily_totals(
+        self,
+        daily_totals: Dict[str, Dict[str, Any]],
+        tariff_cop: float = 850.0,
+    ) -> None:
+        """Sincroniza los totales diarios reales reportados por SmartESS (sin sobrescribir integración más alta del día)."""
+        if not daily_totals:
+            return
+        now_ms = int(time.time() * 1000)
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        with sqlite3.connect(self.db_path) as conn:
+            for date_str, info in daily_totals.items():
+                if date_str == today_str:
+                    # El día de hoy se recalcula siempre en vivo combinando nube + integración 1s
+                    continue
+                pv_kwh = round(float(info.get("pv_energy_kwh", 0.0)), 3)
+                load_kwh = round(float(info.get("load_energy_kwh", 0.0)), 3)
+                min_soc = round(float(info.get("min_soc", 0.0)), 1)
+                max_soc = round(float(info.get("max_soc", 100.0)), 1)
+                start_t = str(info.get("solar_start_time", ""))
+                cov = round(min(100.0, (pv_kwh / max(0.01, load_kwh)) * 100.0), 1) if load_kwh > 0 else 100.0
+                sav = round(load_kwh * tariff_cop, 0)
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO daily_energy_stats
+                    (date_str, pv_energy_kwh, load_energy_kwh, battery_min_soc, battery_max_soc, solar_coverage_percent, savings_cop, updated_at, solar_start_time)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (date_str, pv_kwh, load_kwh, min_soc, max_soc, cov, sav, now_ms, start_t),
+                )
+            conn.commit()
+
+    def recompute_today_energy(
+        self,
+        tariff_cop: float = 850.0,
+        live_extra_pv_kwh: float = 0.0,
+        live_extra_load_kwh: float = 0.0,
+        cloud_pv_today: float = 0.0,
+        cloud_load_today: float = 0.0,
+        cloud_start_time: str = "",
+    ) -> Dict[str, Any]:
         """
-        Calcula las estadísticas agregadas de energía (kWh) y ahorro en pesos (COP)
-        para el Día actual, la Semana actual (últimos 7 días) y el Mes actual.
+        Integra la energía real consumida por la casa (PLoad) y generada por PV desde las 00:00 locales
+        de hoy hasta el instante actual, calculando el ahorro diario en pesos (COP) en base a la
+        energía acumulada consumida por la casa usando energía solar.
         """
         now = datetime.now()
         today_str = now.strftime("%Y-%m-%d")
-        month_prefix = now.strftime("%Y-%m")
+        midnight_dt = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        midnight_ms = int(midnight_dt.timestamp() * 1000)
 
         with sqlite3.connect(self.db_path) as conn:
-            # 1. Día actual
-            cur_day = conn.execute(
-                "SELECT pv_energy_kwh, load_energy_kwh, solar_coverage_percent, savings_cop "
-                "FROM daily_energy_stats WHERE date_str = ?",
-                (today_str,),
-            ).fetchone()
+            rows = conn.execute(
+                """
+                SELECT epoch_ms, pv_power_w, load_power_w, battery_soc
+                FROM telemetry_history
+                WHERE epoch_ms >= ?
+                ORDER BY epoch_ms ASC
+                """,
+                (midnight_ms,),
+            ).fetchall()
 
+        integrated_pv_kwh = 0.0
+        integrated_load_kwh = 0.0
+        min_soc = 100.0
+        max_soc = 0.0
+        first_load_time = ""
+
+        if rows:
+            for idx, (ep, pv_w, load_w, soc) in enumerate(rows):
+                if soc > 0:
+                    min_soc = min(min_soc, soc)
+                    max_soc = max(max_soc, soc)
+                if load_w > 5.0 and not first_load_time:
+                    first_load_time = datetime.fromtimestamp(ep / 1000.0).strftime("%H:%M")
+                if idx > 0:
+                    prev_ep, prev_pv, prev_load, _ = rows[idx - 1]
+                    dt_s = max(0.0, min(600.0, (ep - prev_ep) / 1000.0))
+                    dt_h = dt_s / 3600.0
+                    integrated_pv_kwh += ((prev_pv + pv_w) / 2.0) * dt_h / 1000.0
+                    integrated_load_kwh += ((prev_load + load_w) / 2.0) * dt_h / 1000.0
+        else:
+            min_soc = 0.0
+            max_soc = 100.0
+
+        total_pv_kwh = round(max(integrated_pv_kwh + live_extra_pv_kwh, cloud_pv_today), 3)
+        total_load_kwh = round(max(integrated_load_kwh + live_extra_load_kwh, cloud_load_today), 3)
+
+        if not first_load_time:
+            first_load_time = cloud_start_time
+        elif cloud_start_time and cloud_start_time < first_load_time:
+            first_load_time = cloud_start_time
+
+        # El ahorro económico diario se calcula sobre la energía acumulada consumida por la casa en solar
+        savings_cop = round(total_load_kwh * tariff_cop, 0)
+        cov_pct = round(min(100.0, (total_pv_kwh / max(0.01, total_load_kwh)) * 100.0), 1) if total_load_kwh > 0 else (100.0 if total_pv_kwh > 0 else 0.0)
+        now_ms = int(time.time() * 1000)
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO daily_energy_stats
+                (date_str, pv_energy_kwh, load_energy_kwh, battery_min_soc, battery_max_soc, solar_coverage_percent, savings_cop, updated_at, solar_start_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    today_str,
+                    total_pv_kwh,
+                    total_load_kwh,
+                    round(min_soc, 1) if rows else 0.0,
+                    round(max_soc, 1) if rows else 100.0,
+                    cov_pct,
+                    savings_cop,
+                    now_ms,
+                    first_load_time,
+                ),
+            )
+            conn.commit()
+
+        return {
+            "pv_energy_kwh": total_pv_kwh,
+            "load_energy_kwh": total_load_kwh,
+            "savings_cop": savings_cop,
+            "solar_coverage_percent": cov_pct,
+            "solar_start_time": first_load_time,
+        }
+
+    def get_energy_stats(
+        self,
+        tariff_cop: float = 850.0,
+        live_extra_pv_kwh: float = 0.0,
+        live_extra_load_kwh: float = 0.0,
+        cloud_pv_today: float = 0.0,
+        cloud_load_today: float = 0.0,
+        cloud_start_time: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Calcula las estadísticas agregadas de energía (kWh) y ahorro en pesos (COP)
+        para el Día actual, la Semana actual (últimos 7 días) y el Mes actual,
+        con ahorro calculado sobre la energía acumulada consumida por la casa.
+        """
+        now = datetime.now()
+        today_str = now.strftime("%Y-%m-%d")
+        week_start_str = (now - timedelta(days=6)).strftime("%Y-%m-%d")
+        month_prefix = now.strftime("%Y-%m")
+
+        # 1. Recalcular el día de hoy en tiempo real
+        day_stats = self.recompute_today_energy(
+            tariff_cop=tariff_cop,
+            live_extra_pv_kwh=live_extra_pv_kwh,
+            live_extra_load_kwh=live_extra_load_kwh,
+            cloud_pv_today=cloud_pv_today,
+            cloud_load_today=cloud_load_today,
+            cloud_start_time=cloud_start_time,
+        )
+
+        with sqlite3.connect(self.db_path) as conn:
             # 2. Últimos 7 días (Semana)
             cur_week = conn.execute(
                 "SELECT SUM(pv_energy_kwh), SUM(load_energy_kwh) "
                 "FROM daily_energy_stats "
-                "WHERE date_str >= date('now', '-6 days')"
+                "WHERE date_str >= ? AND date_str <= ?",
+                (week_start_str, today_str),
             ).fetchone()
 
             # 3. Mes actual
@@ -253,43 +444,34 @@ class LocalHistoryDB:
                 (f"{month_prefix}%",),
             ).fetchone()
 
-        # Día
-        pv_day = cur_day[0] if cur_day else 5.3
-        load_day = cur_day[1] if cur_day else 6.1
-        cov_day = cur_day[2] if cur_day else 86.9
-        sav_day = cur_day[3] if cur_day else round(pv_day * tariff_cop, 0)
-
         # Semana
-        pv_week = round(cur_week[0] if cur_week and cur_week[0] else 22.4, 2)
-        load_week = round(cur_week[1] if cur_week and cur_week[1] else 20.6, 2)
-        cov_week = round(min(100.0, (pv_week / max(1.0, load_week)) * 100.0), 1)
-        sav_week = round(pv_week * tariff_cop, 0)
+        pv_week = round(float(cur_week[0] or 0.0), 3)
+        load_week = round(float(cur_week[1] or 0.0), 3)
+        cov_week = round(min(100.0, (pv_week / max(0.01, load_week)) * 100.0), 1) if load_week > 0 else 100.0
+        sav_week = round(load_week * tariff_cop, 0)
 
         # Mes
-        pv_month = round(cur_month[0] if cur_month and cur_month[0] else 48.6, 2)
-        load_month = round(cur_month[1] if cur_month and cur_month[1] else 44.2, 2)
-        cov_month = round(min(100.0, (pv_month / max(1.0, load_month)) * 100.0), 1)
-        sav_month = round(pv_month * tariff_cop, 0)
+        pv_month = round(float(cur_month[0] or 0.0), 3)
+        load_month = round(float(cur_month[1] or 0.0), 3)
+        cov_month = round(min(100.0, (pv_month / max(0.01, load_month)) * 100.0), 1) if load_month > 0 else 100.0
+        sav_month = round(load_month * tariff_cop, 0)
 
         return {
             "tariff_cop": tariff_cop,
-            "day": {
-                "pv_energy_kwh": pv_day,
-                "load_energy_kwh": load_day,
-                "savings_cop": sav_day,
-                "solar_coverage_percent": cov_day,
-            },
+            "day": day_stats,
             "week": {
                 "pv_energy_kwh": pv_week,
                 "load_energy_kwh": load_week,
                 "savings_cop": sav_week,
                 "solar_coverage_percent": cov_week,
+                "solar_start_time": "",
             },
             "month": {
                 "pv_energy_kwh": pv_month,
                 "load_energy_kwh": load_month,
                 "savings_cop": sav_month,
                 "solar_coverage_percent": cov_month,
+                "solar_start_time": "",
             },
             "updated_at_ms": int(time.time() * 1000),
         }
@@ -789,8 +971,11 @@ class SolarBackendService:
             cooldown_sec=int(os.getenv("ALERT_COOLDOWN_SECONDS", "900")),
         )
 
-        self.tariff_cop = 850.0
-        self.weekly_report_recipient = os.getenv("WEEKLY_REPORT_PHONE", "")
+        self.tariff_cop = float(self.db.get_meta("tariff_cop", "850.0") or "850.0")
+        self.weekly_report_recipient = self.db.get_meta(
+            "weekly_report_recipient",
+            os.getenv("WEEKLY_REPORT_PHONE", ""),
+        )
         self._last_weekly_report_date = ""
 
         # Cliente MQTT (Compatible con paho-mqtt v2)
@@ -806,6 +991,10 @@ class SolarBackendService:
 
         self._last_history_save_time = 0.0
         self._last_history_publish_time = 0.0
+        self._last_stats_publish_time = 0.0
+        self._last_telemetry_integrate_time = time.time()
+        self._live_extra_pv_kwh = 0.0
+        self._live_extra_load_kwh = 0.0
 
     def _on_mqtt_connect(self, client, userdata, flags, reason_code, properties):
         if reason_code == 0:
@@ -813,6 +1002,7 @@ class SolarBackendService:
             # Suscribirse a comandos desde la app móvil (ej. solicitud de historial o prueba de alerta)
             client.subscribe("hogar/solar/comando", qos=1)
             self._publish_24h_history()
+            self._publish_energy_stats()
         else:
             logger.error(f"Fallo al conectar a MQTT, código: {reason_code}")
 
@@ -824,8 +1014,9 @@ class SolarBackendService:
         try:
             payload = msg.payload.decode("utf-8").strip()
             logger.info(f"Comando recibido en {msg.topic}: {payload}")
-            if payload == "GET_HISTORY":
-                self._publish_24h_history()
+            if payload in ("GET_HISTORY", "GET_STATS"):
+                if payload == "GET_HISTORY":
+                    self._publish_24h_history()
                 self._publish_energy_stats()
             elif payload.startswith("SET_THRESHOLD:"):
                 new_val = float(payload.split(":", 1)[1])
@@ -835,11 +1026,15 @@ class SolarBackendService:
                 logger.info(f"Umbral de alerta de batería actualizado a {new_val:.1f}% desde la App.")
             elif payload.startswith("SET_REPORT_CONFIG:"):
                 cfg = json.loads(payload.split(":", 1)[1])
-                if "phone" in cfg and cfg["phone"]:
-                    self.weekly_report_recipient = cfg["phone"]
+                if "phone" in cfg:
+                    self.weekly_report_recipient = str(cfg["phone"]).strip()
+                    self.db.set_meta("weekly_report_recipient", self.weekly_report_recipient)
                 if "tariff" in cfg:
-                    self.tariff_cop = float(cfg["tariff"])
-                logger.info(f"Configuración de informe actualizada: Tel/ID={self.weekly_report_recipient}, Tarifa=\${self.tariff_cop} COP")
+                    self.tariff_cop = max(50.0, float(cfg["tariff"]))
+                    self.db.set_meta("tariff_cop", str(self.tariff_cop))
+                logger.info(
+                    f"Configuración de informe actualizada: Tel/ID={self.weekly_report_recipient}, Tarifa=${self.tariff_cop} COP"
+                )
                 self._publish_energy_stats()
             elif payload == "TEST_CRITICAL_ALERT":
                 # Permite probar el sistema de alerta crítica desde la app móvil
@@ -852,6 +1047,18 @@ class SolarBackendService:
                 self.alert_manager.check_and_trigger(sample, self.mqtt_client, self.topic_alert)
         except Exception as exc:
             logger.error(f"Error procesando comando MQTT: {exc}")
+
+    def _get_today_cloud_summary(self) -> Dict[str, Any]:
+        if self.mode != "SMARTESS_CLOUD":
+            return {}
+        cloud_client = getattr(self.reader, "_smartess_client", None)
+        if cloud_client is None:
+            return {}
+        daily_totals = getattr(cloud_client, "daily_cloud_totals", None) or {}
+        if daily_totals:
+            self.db.upsert_cloud_daily_totals(daily_totals, tariff_cop=self.tariff_cop)
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        return daily_totals.get(today_str, {})
 
     def _publish_24h_history(self) -> None:
         if self.mode == "SMARTESS_CLOUD":
@@ -873,11 +1080,25 @@ class SolarBackendService:
         self.mqtt_client.publish(self.topic_history, payload, qos=1, retain=True)
         logger.info(f"Historial de 24h publicado en {self.topic_history} ({len(history_points)} puntos)")
 
-    def _publish_energy_stats(self) -> None:
-        stats = self.db.get_energy_stats(tariff_cop=self.tariff_cop)
+    def _publish_energy_stats(self, quiet: bool = False) -> None:
+        today_cloud = self._get_today_cloud_summary()
+        stats = self.db.get_energy_stats(
+            tariff_cop=self.tariff_cop,
+            live_extra_pv_kwh=self._live_extra_pv_kwh,
+            live_extra_load_kwh=self._live_extra_load_kwh,
+            cloud_pv_today=float(today_cloud.get("pv_energy_kwh", 0.0)),
+            cloud_load_today=float(today_cloud.get("load_energy_kwh", 0.0)),
+            cloud_start_time=str(today_cloud.get("solar_start_time", "")),
+        )
         payload = json.dumps(stats)
         self.mqtt_client.publish(self.topic_stats, payload, qos=1, retain=True)
-        logger.info(f"Estadísticas de energía y ahorro publicadas en {self.topic_stats}")
+        if not quiet:
+            logger.info(
+                f"Estadísticas publicadas en {self.topic_stats}: "
+                f"Hoy Load={stats['day']['load_energy_kwh']:.2f} kWh | "
+                f"PV={stats['day']['pv_energy_kwh']:.2f} kWh | "
+                f"Ahorro=${int(stats['day']['savings_cop']):,} COP"
+            )
 
     def _check_weekly_report_schedule(self) -> None:
         """
@@ -892,7 +1113,15 @@ class SolarBackendService:
                 self._dispatch_weekly_summary_report()
 
     def _dispatch_weekly_summary_report(self) -> None:
-        stats = self.db.get_energy_stats(tariff_cop=self.tariff_cop)
+        today_cloud = self._get_today_cloud_summary()
+        stats = self.db.get_energy_stats(
+            tariff_cop=self.tariff_cop,
+            live_extra_pv_kwh=self._live_extra_pv_kwh,
+            live_extra_load_kwh=self._live_extra_load_kwh,
+            cloud_pv_today=float(today_cloud.get("pv_energy_kwh", 0.0)),
+            cloud_load_today=float(today_cloud.get("load_energy_kwh", 0.0)),
+            cloud_start_time=str(today_cloud.get("solar_start_time", "")),
+        )
         week = stats.get("week", {})
         pv_kwh = week.get("pv_energy_kwh", 0.0)
         load_kwh = week.get("load_energy_kwh", 0.0)
@@ -901,11 +1130,11 @@ class SolarBackendService:
 
         report_msg = (
             f"📊 *REPORTE SEMANAL SOLAR (DOMINGO 8:00 PM)*\n\n"
-            f"🌞 Generación Solar: *{pv_kwh:.1f} kWh*\n"
-            f"🏠 Consumo Atendido: *{load_kwh:.1f} kWh*\n"
-            f"💰 Ahorro Estimado: *\${int(savings):,} COP*\n"
+            f"🌞 Generación Solar: *{pv_kwh:.2f} kWh*\n"
+            f"🏠 Consumo Atendido: *{load_kwh:.2f} kWh*\n"
+            f"💰 Ahorro Estimado: *${int(savings):,} COP*\n"
             f"🌿 Cobertura Solar: *{cov:.1f}%*\n"
-            f"⚡ Tarifa Base: *\${int(self.tariff_cop)} COP/kWh*\n\n"
+            f"⚡ Tarifa Base: *${int(self.tariff_cop)} COP/kWh*\n\n"
             f"¡Excelente semana de autosuficiencia energética!"
         )
 
@@ -952,6 +1181,7 @@ class SolarBackendService:
                         self.db.bulk_upsert_cloud_history(real_points)
                         logger.info(f"Sincronizados {len(real_points)} puntos históricos reales de 24h desde Casa_Falla.")
                         self._publish_24h_history()
+                        self._publish_energy_stats()
         except Exception as e:
             logger.warning(f"No se pudo sincronizar historial 24h inicial de nube: {e}")
 
@@ -981,15 +1211,28 @@ class SolarBackendService:
                 # Verificar si la batería bajó del umbral configurado
                 self.alert_manager.check_and_trigger(telemetry, self.mqtt_client, self.topic_alert)
 
-                # Guardar muestra en base de datos SQLite cada 15 segundos para alta resolución en rangos cortos
+                # Integrar energía en vivo segundo a segundo entre guardados de BD
                 now = time.time()
+                dt_h = max(0.0, min(15.0, now - self._last_telemetry_integrate_time)) / 3600.0
+                self._last_telemetry_integrate_time = now
+                self._live_extra_pv_kwh += (telemetry.pv_power_w * dt_h) / 1000.0
+                self._live_extra_load_kwh += (telemetry.load_power_w * dt_h) / 1000.0
+
+                # Guardar muestra en base de datos SQLite cada 15 segundos para alta resolución en rangos cortos
                 if (now - self._last_history_save_time) >= 15.0:
                     self.db.insert_sample(telemetry)
                     self._last_history_save_time = now
+                    self._live_extra_pv_kwh = 0.0
+                    self._live_extra_load_kwh = 0.0
+
+                # Publicar estadísticas en vivo cada 5 segundos
+                if (now - self._last_stats_publish_time) >= 5.0:
+                    self._publish_energy_stats(quiet=True)
+                    self._last_stats_publish_time = now
 
                 if (now - self._last_history_publish_time) >= 60.0:
                     self._publish_24h_history()
-                    self._publish_energy_stats()
+                    self._publish_energy_stats(quiet=False)
                     self._check_weekly_report_schedule()
                     self._last_history_publish_time = now
 
