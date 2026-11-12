@@ -87,4 +87,58 @@ class SolarReading {
       sourceMode: (json['source_mode'] as String?) ?? 'LOCAL',
     );
   }
+
+  /// Calcula la autonomía restante estimada en base a la capacidad efectiva
+  /// del banco (4910 Wh = 49.1 Wh por 1% SOC) y el consumo o carga actual.
+  String estimateAutonomy({required double threshold}) {
+    const double whPerSocPoint = 49.1;
+
+    if (status == SolarSystemStatus.discharging || batteryPowerW < -15.0) {
+      final double dischargeRateW = batteryDischargeW > 15.0
+          ? batteryDischargeW
+          : (batteryPowerW < 0 ? batteryPowerW.abs() : loadPowerW);
+
+      if (dischargeRateW <= 15.0) {
+        return 'Consumo mínimo';
+      }
+
+      final double availableSoc = batterySoc - threshold;
+      if (availableSoc <= 0) {
+        return 'Batería en umbral ($batterySoc%)';
+      }
+
+      final double availableWh = availableSoc * whPerSocPoint;
+      final double hoursLeft = availableWh / dischargeRateW;
+
+      final int h = hoursLeft.floor();
+      final int m = ((hoursLeft - h) * 60).round();
+      if (h == 0 && m == 0) return '< 1 min restante';
+      if (h == 0) return '${m}m hasta ${threshold.toStringAsFixed(0)}%';
+      return '${h}h ${m.toString().padLeft(2, '0')}m hasta ${threshold.toStringAsFixed(0)}%';
+    } else if (status == SolarSystemStatus.charging || batteryPowerW > 15.0) {
+      final double chargeRateW = batteryChargeW > 15.0
+          ? batteryChargeW
+          : (batteryPowerW > 0 ? batteryPowerW : (pvPowerW - loadPowerW));
+
+      if (chargeRateW <= 15.0) {
+        return 'Carga lenta';
+      }
+
+      final double neededSoc = (100.0 - batterySoc).clamp(0.0, 100.0);
+      if (neededSoc <= 0.5) {
+        return 'Batería llena (100%)';
+      }
+
+      final double neededWh = neededSoc * whPerSocPoint;
+      final double hoursLeft = neededWh / chargeRateW;
+
+      final int h = hoursLeft.floor();
+      final int m = ((hoursLeft - h) * 60).round();
+      if (h == 0 && m == 0) return 'Casi completa';
+      if (h == 0) return '${m}m para 100%';
+      return '${h}h ${m.toString().padLeft(2, '0')}m para 100%';
+    }
+
+    return 'En reposo / Estable';
+  }
 }

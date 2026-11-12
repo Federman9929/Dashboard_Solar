@@ -4,6 +4,7 @@ import 'dart:math' as math;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../domain/models/battery_alert_mode.dart';
+import '../../domain/models/solar_energy_stats.dart';
 import '../../domain/models/solar_reading.dart';
 import '../services/mqtt_solar_service.dart';
 import '../services/notification_alert_service.dart';
@@ -29,6 +30,8 @@ class SolarRepository {
   static const String _prefDemoMode = 'demo_mode_enabled';
   static const String _prefCriticalThreshold = 'critical_soc_threshold';
   static const String _prefAlertMode = 'battery_alert_mode';
+  static const String _prefKwhTariffCop = 'kwh_tariff_cop';
+  static const String _prefWeeklyReportPhone = 'weekly_report_phone';
 
   String _brokerHost = '192.168.0.224';
   int _brokerPort = 1883;
@@ -37,6 +40,8 @@ class SolarRepository {
   bool _demoMode = false;
   double _criticalSocThreshold = 30.0;
   BatteryAlertMode _alertMode = BatteryAlertMode.simpleNotification;
+  double _kwhTariffCop = 850.0;
+  String _weeklyReportPhone = '';
   Timer? _demoTimer;
 
   String get brokerHost => _brokerHost;
@@ -46,6 +51,8 @@ class SolarRepository {
   bool get demoMode => _demoMode;
   double get criticalSocThreshold => _criticalSocThreshold;
   BatteryAlertMode get alertMode => _alertMode;
+  double get kwhTariffCop => _kwhTariffCop;
+  String get weeklyReportPhone => _weeklyReportPhone;
   bool get isAlarmRinging => _notificationService.isRinging;
 
   Stream<MqttConnectionStateStatus> get connectionStream =>
@@ -64,6 +71,8 @@ class SolarRepository {
       StreamController<List<SolarReading>>.broadcast();
   final _criticalAlertBannerController =
       StreamController<SolarReading?>.broadcast();
+  final _energyStatsController =
+      StreamController<SolarEnergyStatsBundle>.broadcast();
 
   Stream<SolarReading> get readingStream => _readingStreamController.stream;
   Stream<List<SolarReading>> get history24hStream =>
@@ -72,6 +81,11 @@ class SolarRepository {
       _realtimeWindowController.stream;
   Stream<SolarReading?> get criticalAlertBannerStream =>
       _criticalAlertBannerController.stream;
+  Stream<SolarEnergyStatsBundle> get energyStatsStream =>
+      _energyStatsController.stream;
+
+  SolarEnergyStatsBundle _currentStats = SolarEnergyStatsBundle.initial();
+  SolarEnergyStatsBundle get currentStats => _currentStats;
 
   final List<SolarReading> _history24h = [];
   final List<SolarReading> _realtimeReadings = [];
@@ -108,6 +122,9 @@ class SolarRepository {
     _demoMode = prefs.getBool(_prefDemoMode) ?? false;
     _criticalSocThreshold = prefs.getDouble(_prefCriticalThreshold) ?? 30.0;
     _alertMode = BatteryAlertMode.fromCode(prefs.getString(_prefAlertMode));
+    _kwhTariffCop = prefs.getDouble(_prefKwhTariffCop) ?? 850.0;
+    _weeklyReportPhone = prefs.getString(_prefWeeklyReportPhone) ?? '';
+    _currentStats = SolarEnergyStatsBundle.initial(tariff: _kwhTariffCop);
 
     // Solo pre-cargar curva sintética si el usuario activó explícitamente el modo Demo
     if (_demoMode) {
@@ -160,6 +177,13 @@ class SolarRepository {
         sourceMode: 'ALERTA_MQTT',
       );
       _triggerCriticalAlertFlow(criticalReading, force: true);
+    });
+
+    // Escuchar estadísticas agregadas de energía y ahorro
+    _mqttService.statsStream.listen((statsJson) {
+      final bundle = SolarEnergyStatsBundle.fromJson(statsJson);
+      _currentStats = bundle;
+      _energyStatsController.add(bundle);
     });
 
     if (_demoMode) {
@@ -323,6 +347,8 @@ class SolarRepository {
     required bool demoMode,
     double? criticalThreshold,
     BatteryAlertMode? alertMode,
+    double? kwhTariffCop,
+    String? weeklyReportPhone,
   }) async {
     _brokerHost = host.trim();
     _brokerPort = port;
@@ -335,6 +361,12 @@ class SolarRepository {
     if (alertMode != null) {
       _alertMode = alertMode;
     }
+    if (kwhTariffCop != null) {
+      _kwhTariffCop = kwhTariffCop.clamp(50.0, 5000.0);
+    }
+    if (weeklyReportPhone != null) {
+      _weeklyReportPhone = weeklyReportPhone.trim();
+    }
 
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_prefBrokerHost, _brokerHost);
@@ -344,9 +376,14 @@ class SolarRepository {
     await prefs.setBool(_prefDemoMode, _demoMode);
     await prefs.setDouble(_prefCriticalThreshold, _criticalSocThreshold);
     await prefs.setString(_prefAlertMode, _alertMode.code);
+    await prefs.setDouble(_prefKwhTariffCop, _kwhTariffCop);
+    await prefs.setString(_prefWeeklyReportPhone, _weeklyReportPhone);
 
     _mqttService.sendCommand(
       'SET_THRESHOLD:${_criticalSocThreshold.toStringAsFixed(1)}',
+    );
+    _mqttService.sendCommand(
+      'SET_REPORT_CONFIG:{"phone":"$_weeklyReportPhone","tariff":$_kwhTariffCop}',
     );
 
     _demoTimer?.cancel();
@@ -447,5 +484,6 @@ class SolarRepository {
     await _history24hController.close();
     await _realtimeWindowController.close();
     await _criticalAlertBannerController.close();
+    await _energyStatsController.close();
   }
 }

@@ -27,6 +27,7 @@ dependencies:
   http: ^1.2.1
   # Iconos Material y Cupertino
   cupertino_icons: ^1.0.8
+  share_plus: ^13.3.1
 
 dev_dependencies:
   flutter_test:

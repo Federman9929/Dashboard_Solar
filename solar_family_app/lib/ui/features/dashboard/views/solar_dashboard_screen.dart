@@ -5,6 +5,7 @@ import 'package:solar_family_monitor/domain/models/battery_alert_mode.dart';
 import 'package:solar_family_monitor/domain/models/solar_reading.dart';
 import 'package:solar_family_monitor/ui/features/dashboard/view_models/solar_dashboard_view_model.dart';
 import 'widgets/interactive_solar_chart.dart';
+import 'widgets/solar_reports_view.dart';
 
 class SolarDashboardScreen extends StatelessWidget {
   const SolarDashboardScreen({super.key, required this.viewModel});
@@ -120,12 +121,19 @@ class SolarDashboardScreen extends StatelessWidget {
     );
   }
 
-  /// Renderiza únicamente 1 gráfica activa según el ícono seleccionado abajo:
-  /// 0 = Batería (%), 1 = Generación PV (W), 2 = Carga de la Casa (W)
+  /// Renderiza únicamente 1 gráfica o informe activo según el ícono seleccionado abajo:
+  /// 0 = Batería (%), 1 = Generación PV (W), 2 = Carga Casa (W), 3 = Informe y Ahorro
   Widget _buildSelectedChart({
     required int selectedIndex,
     required double threshold,
   }) {
+    if (selectedIndex == 3) {
+      return SolarReportsView(
+        viewModel: viewModel,
+        currentReading: viewModel.currentReading,
+      );
+    }
+
     final timeline = viewModel.unifiedTimeline;
     switch (selectedIndex) {
       case 0:
@@ -175,8 +183,8 @@ class SolarDashboardScreen extends StatelessWidget {
     }
   }
 
-  /// Selector inferior minimalista de gráficas: SOLO ÍCONOS (sin texto)
-  /// [Batería] • [Paneles PV] • [Carga Casa]
+  /// Selector inferior minimalista: SOLO ÍCONOS (sin texto)
+  /// [Batería] • [Paneles PV] • [Carga Casa] • [Informe y Ahorro]
   Widget _buildMinimalIconChartSelector(int selectedIndex) {
     return Container(
       decoration: const BoxDecoration(
@@ -188,7 +196,7 @@ class SolarDashboardScreen extends StatelessWidget {
       child: SafeArea(
         top: false,
         child: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 24),
+          padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
@@ -209,6 +217,12 @@ class SolarDashboardScreen extends StatelessWidget {
                 selectedIndex: selectedIndex,
                 icon: Icons.home_rounded,
                 activeColor: const Color(0xFF40C4FF),
+              ),
+              _buildChartIconButton(
+                index: 3,
+                selectedIndex: selectedIndex,
+                icon: Icons.description_rounded,
+                activeColor: const Color(0xFFB388FF),
               ),
             ],
           ),
@@ -828,10 +842,10 @@ class SolarDashboardScreen extends StatelessWidget {
               const SizedBox(width: 8),
               const Expanded(
                 child: Text(
-                  'UMBRAL DE AVISO DE BATERÍA (SETPOINT)',
+                  'Aviso de Batería',
                   style: TextStyle(
-                    color: Colors.white70,
-                    fontSize: 11,
+                    color: Colors.white,
+                    fontSize: 13,
                     fontWeight: FontWeight.w700,
                   ),
                 ),
@@ -898,32 +912,12 @@ class SolarDashboardScreen extends StatelessWidget {
           const SizedBox(height: 10),
           Row(
             children: [
-              const Icon(
-                Icons.sensors_rounded,
-                size: 15,
-                color: Colors.white54,
-              ),
-              const SizedBox(width: 6),
-              const Text(
-                'TIPO DE ALERTA AL CAER DE ESE NIVEL:',
-                style: TextStyle(
-                  color: Colors.white60,
-                  fontSize: 10,
-                  fontWeight: FontWeight.w700,
-                  letterSpacing: 0.4,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Row(
-            children: [
               Expanded(
                 child: _buildAlertModeOptionTile(
                   isSelected: alertMode == BatteryAlertMode.simpleNotification,
                   icon: Icons.notifications_active_outlined,
-                  title: 'Notificación Simple',
-                  subtitle: 'Aviso sonoro notorio sin sirena',
+                  title: 'Silenciosa',
+                  subtitle: 'Notificación simple',
                   accentColor: const Color(0xFFFFB300),
                   onTap: () => viewModel.updateAlertMode(
                     BatteryAlertMode.simpleNotification,
@@ -935,8 +929,8 @@ class SolarDashboardScreen extends StatelessWidget {
                 child: _buildAlertModeOptionTile(
                   isSelected: alertMode == BatteryAlertMode.immediateAlarm,
                   icon: Icons.notification_important_rounded,
-                  title: 'Alarma Inmediata',
-                  subtitle: 'Sirena continua hasta silenciar',
+                  title: 'Alarma',
+                  subtitle: 'Alarma inmediata',
                   accentColor: const Color(0xFFFF5252),
                   onTap: () => viewModel.updateAlertMode(
                     BatteryAlertMode.immediateAlarm,
@@ -1055,6 +1049,10 @@ class SolarDashboardScreen extends StatelessWidget {
         TextEditingController(text: viewModel.brokerPort.toString());
     final tgTokenCtrl = TextEditingController(text: viewModel.telegramBotToken);
     final tgChatCtrl = TextEditingController(text: viewModel.telegramChatId);
+    final tariffCtrl =
+        TextEditingController(text: viewModel.kwhTariffCop.toStringAsFixed(0));
+    final reportPhoneCtrl =
+        TextEditingController(text: viewModel.weeklyReportPhone);
     bool demoMode = viewModel.demoMode;
     double threshold = viewModel.criticalSocThreshold;
     BatteryAlertMode alertMode = viewModel.alertMode;
@@ -1082,7 +1080,7 @@ class SolarDashboardScreen extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     const Text(
-                      'Configuración de Red Local y Avisos',
+                      'Configuración',
                       style: TextStyle(
                         color: Colors.white,
                         fontSize: 18,
@@ -1094,7 +1092,7 @@ class SolarDashboardScreen extends StatelessWidget {
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
                         const Text(
-                          'Umbral de aviso de batería (Setpoint):',
+                          'Aviso de batería:',
                           style: TextStyle(color: Colors.white, fontSize: 14),
                         ),
                         Text(
@@ -1118,11 +1116,6 @@ class SolarDashboardScreen extends StatelessWidget {
                           setSheetState(() => threshold = val.roundToDouble()),
                     ),
                     const SizedBox(height: 6),
-                    const Text(
-                      'Tipo de alerta al caer del umbral:',
-                      style: TextStyle(color: Colors.white, fontSize: 14),
-                    ),
-                    const SizedBox(height: 8),
                     Row(
                       children: [
                         Expanded(
@@ -1130,8 +1123,8 @@ class SolarDashboardScreen extends StatelessWidget {
                             isSelected:
                                 alertMode == BatteryAlertMode.simpleNotification,
                             icon: Icons.notifications_active_outlined,
-                            title: 'Notificación Simple',
-                            subtitle: 'Aviso notorio sin sirena',
+                            title: 'Silenciosa',
+                            subtitle: 'Notificación simple',
                             accentColor: const Color(0xFFFFB300),
                             onTap: () => setSheetState(
                               () => alertMode =
@@ -1145,8 +1138,8 @@ class SolarDashboardScreen extends StatelessWidget {
                             isSelected:
                                 alertMode == BatteryAlertMode.immediateAlarm,
                             icon: Icons.notification_important_rounded,
-                            title: 'Alarma Inmediata',
-                            subtitle: 'Sirena continua audible',
+                            title: 'Alarma',
+                            subtitle: 'Alarma inmediata',
                             accentColor: const Color(0xFFFF5252),
                             onTap: () => setSheetState(
                               () => alertMode =
@@ -1156,16 +1149,43 @@ class SolarDashboardScreen extends StatelessWidget {
                         ),
                       ],
                     ),
-                    const Divider(color: Colors.white12),
+                    const Divider(color: Colors.white12, height: 24),
+                    const Text(
+                      'Ahorro e Informes Semanales',
+                      style: TextStyle(
+                        color: Color(0xFF00E676),
+                        fontSize: 13,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: tariffCtrl,
+                      keyboardType: TextInputType.number,
+                      style: const TextStyle(color: Colors.white),
+                      decoration: const InputDecoration(
+                        labelText: 'Valor del kWh (\$ COP)',
+                        hintText: 'Ej: 850',
+                        labelStyle: TextStyle(color: Colors.white70),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: reportPhoneCtrl,
+                      keyboardType: TextInputType.phone,
+                      style: const TextStyle(color: Colors.white),
+                      decoration: const InputDecoration(
+                        labelText: 'Teléfono / Chat ID para Reporte Dominical (8 PM)',
+                        hintText: '+573001234567 o chat_id Telegram',
+                        labelStyle: TextStyle(color: Colors.white70),
+                      ),
+                    ),
+                    const Divider(color: Colors.white12, height: 24),
                     SwitchListTile(
                       contentPadding: EdgeInsets.zero,
                       title: const Text(
-                        'Modo Simulador en el Celular (Sin red MQTT)',
+                        'Modo Simulador Local',
                         style: TextStyle(color: Colors.white, fontSize: 14),
-                      ),
-                      subtitle: const Text(
-                        'Útil para probar gráficas y avisos cuando estás fuera de casa',
-                        style: TextStyle(color: Colors.white54, fontSize: 12),
                       ),
                       value: demoMode,
                       activeColor: const Color(0xFF00E676),
@@ -1176,12 +1196,12 @@ class SolarDashboardScreen extends StatelessWidget {
                       controller: hostCtrl,
                       style: const TextStyle(color: Colors.white),
                       decoration: const InputDecoration(
-                        labelText: 'IP Local de la MacBook (Mosquitto MQTT)',
-                        hintText: 'Ej: 192.168.0.224',
+                        labelText: 'IP Local MacBook (MQTT)',
+                        hintText: '192.168.0.224',
                         labelStyle: TextStyle(color: Colors.white70),
                       ),
                     ),
-                    const SizedBox(height: 10),
+                    const SizedBox(height: 8),
                     TextField(
                       controller: portCtrl,
                       keyboardType: TextInputType.number,
@@ -1192,15 +1212,7 @@ class SolarDashboardScreen extends StatelessWidget {
                         labelStyle: TextStyle(color: Colors.white70),
                       ),
                     ),
-                    const SizedBox(height: 16),
-                    Text(
-                      'Aviso por Telegram (<${threshold.toStringAsFixed(0)}% Batería)',
-                      style: const TextStyle(
-                        color: Colors.amber,
-                        fontSize: 13,
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
+                    const SizedBox(height: 12),
                     TextField(
                       controller: tgTokenCtrl,
                       style: const TextStyle(color: Colors.white),
@@ -1209,12 +1221,12 @@ class SolarDashboardScreen extends StatelessWidget {
                         labelStyle: TextStyle(color: Colors.white70),
                       ),
                     ),
-                    const SizedBox(height: 10),
+                    const SizedBox(height: 8),
                     TextField(
                       controller: tgChatCtrl,
                       style: const TextStyle(color: Colors.white),
                       decoration: const InputDecoration(
-                        labelText: 'Telegram Chat ID Familiar (Opcional)',
+                        labelText: 'Telegram Chat ID (Opcional)',
                         labelStyle: TextStyle(color: Colors.white70),
                       ),
                     ),
@@ -1236,6 +1248,8 @@ class SolarDashboardScreen extends StatelessWidget {
                             demoMode: demoMode,
                             criticalThreshold: threshold,
                             alertMode: alertMode,
+                            kwhTariffCop: double.tryParse(tariffCtrl.text) ?? 850.0,
+                            weeklyReportPhone: reportPhoneCtrl.text,
                           );
                           Navigator.of(ctx).pop();
                         },

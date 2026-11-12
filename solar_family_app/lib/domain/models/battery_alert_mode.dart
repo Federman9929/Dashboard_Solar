@@ -2,13 +2,13 @@
 enum BatteryAlertMode {
   simpleNotification(
     'simple',
-    'Notificación Simple',
-    'Aviso notorio con sonido del sistema y vibración (sin sirena continua)',
+    'Silenciosa',
+    'Notificación simple con sonido y vibración',
   ),
   immediateAlarm(
     'alarm',
-    'Alarma Inmediata',
-    'Alarma sonora continua tipo sirena que alerta de inmediato hasta silenciar',
+    'Alarma',
+    'Alarma sonora continua inmediata',
   );
 
   const BatteryAlertMode(this.code, this.displayName, this.description);

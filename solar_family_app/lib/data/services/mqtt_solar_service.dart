@@ -83,12 +83,14 @@ class MqttSolarService {
   static const String topicHistory = 'hogar/solar/historial_24h';
   static const String topicAlert = 'hogar/solar/alerta';
   static const String topicCommand = 'hogar/solar/comando';
+  static const String topicStats = 'hogar/solar/estadisticas';
 
   final _telemetryController =
       StreamController<Map<String, dynamic>>.broadcast();
   final _historyController =
       StreamController<List<Map<String, dynamic>>>.broadcast();
   final _alertController = StreamController<Map<String, dynamic>>.broadcast();
+  final _statsController = StreamController<Map<String, dynamic>>.broadcast();
   final _connectionController =
       StreamController<MqttConnectionStateStatus>.broadcast();
   final _diagnosticsController =
@@ -99,6 +101,7 @@ class MqttSolarService {
   Stream<List<Map<String, dynamic>>> get historyStream =>
       _historyController.stream;
   Stream<Map<String, dynamic>> get alertStream => _alertController.stream;
+  Stream<Map<String, dynamic>> get statsStream => _statsController.stream;
   Stream<MqttConnectionStateStatus> get connectionStream =>
       _connectionController.stream;
   Stream<MqttDiagnosticsSnapshot> get diagnosticsStream =>
@@ -410,6 +413,7 @@ class MqttSolarService {
     client.subscribe(topicTelemetry, MqttQos.atMostOnce);
     client.subscribe(topicHistory, MqttQos.atLeastOnce);
     client.subscribe(topicAlert, MqttQos.atLeastOnce);
+    client.subscribe(topicStats, MqttQos.atLeastOnce);
 
     _emitDiagnostics(
       step: 5,
@@ -520,6 +524,8 @@ class MqttSolarService {
               _historyController.add(points);
             } else if (event.topic == topicAlert) {
               _alertController.add(decoded);
+            } else if (event.topic == topicStats) {
+              _statsController.add(decoded);
             }
           } catch (e) {
             debugPrint('Error decodificando JSON de ${event.topic}: $e');
@@ -625,6 +631,7 @@ class MqttSolarService {
     await _telemetryController.close();
     await _historyController.close();
     await _alertController.close();
+    await _statsController.close();
     await _connectionController.close();
     await _diagnosticsController.close();
   }

@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:solar_family_monitor/data/repositories/solar_repository.dart';
 import 'package:solar_family_monitor/data/services/mqtt_solar_service.dart';
 import 'package:solar_family_monitor/domain/models/battery_alert_mode.dart';
+import 'package:solar_family_monitor/domain/models/solar_energy_stats.dart';
 import 'package:solar_family_monitor/domain/models/solar_reading.dart';
 
 class SolarDashboardViewModel extends ChangeNotifier {
@@ -34,10 +35,20 @@ class SolarDashboardViewModel extends ChangeNotifier {
   MqttDiagnosticsSnapshot get diagnostics =>
       _diagnostics ?? _repository.currentDiagnostics;
 
-  /// Índice de la gráfica activa en el selector inferior de solo íconos:
-  /// 0 = Batería (SOC 24h), 1 = Paneles Solares PV (W), 2 = Carga de la Casa (W)
+  /// Índice de la pestaña activa en el selector inferior:
+  /// 0 = Batería (SOC), 1 = Solar (PV), 2 = Consumo Hogar, 3 = Informe y Ahorro
   int _selectedChartIndex = 0;
   int get selectedChartIndex => _selectedChartIndex;
+
+  SolarEnergyStatsBundle get energyStats => _repository.currentStats;
+  double get kwhTariffCop => _repository.kwhTariffCop;
+  String get weeklyReportPhone => _repository.weeklyReportPhone;
+
+  String get autonomyText {
+    final reading = _currentReading;
+    if (reading == null) return '--';
+    return reading.estimateAutonomy(threshold: _repository.criticalSocThreshold);
+  }
 
   String get brokerHost => _repository.brokerHost;
   int get brokerPort => _repository.brokerPort;
@@ -94,6 +105,12 @@ class SolarDashboardViewModel extends ChangeNotifier {
       }),
     );
 
+    _subscriptions.add(
+      _repository.energyStatsStream.listen((_) {
+        notifyListeners();
+      }),
+    );
+
     await _repository.initialize();
     _history24h = _repository.history24h;
     _realtimeReadings = _repository.realtimeReadings;
@@ -106,7 +123,7 @@ class SolarDashboardViewModel extends ChangeNotifier {
 
   void selectChart(int index) {
     if (_selectedChartIndex == index) return;
-    _selectedChartIndex = index.clamp(0, 2);
+    _selectedChartIndex = index.clamp(0, 3);
     notifyListeners();
   }
 
@@ -140,6 +157,8 @@ class SolarDashboardViewModel extends ChangeNotifier {
     required bool demoMode,
     double? criticalThreshold,
     BatteryAlertMode? alertMode,
+    double? kwhTariffCop,
+    String? weeklyReportPhone,
   }) async {
     await _repository.updateSettings(
       host: host,
@@ -149,6 +168,8 @@ class SolarDashboardViewModel extends ChangeNotifier {
       demoMode: demoMode,
       criticalThreshold: criticalThreshold,
       alertMode: alertMode,
+      kwhTariffCop: kwhTariffCop,
+      weeklyReportPhone: weeklyReportPhone,
     );
     notifyListeners();
   }
