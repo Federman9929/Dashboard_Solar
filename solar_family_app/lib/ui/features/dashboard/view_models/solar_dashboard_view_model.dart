@@ -52,6 +52,11 @@ class SolarDashboardViewModel extends ChangeNotifier {
 
   String get brokerHost => _repository.brokerHost;
   int get brokerPort => _repository.brokerPort;
+  String get cloudHost => _repository.cloudHost;
+  int get cloudPort => _repository.cloudPort;
+  String get cloudUsername => _repository.cloudUsername;
+  String get cloudPassword => _repository.cloudPassword;
+  bool get cloudUseTls => _repository.cloudUseTls;
   String get telegramBotToken => _repository.telegramBotToken;
   String get telegramChatId => _repository.telegramChatId;
   bool get demoMode => _repository.demoMode;
@@ -159,6 +164,11 @@ class SolarDashboardViewModel extends ChangeNotifier {
     BatteryAlertMode? alertMode,
     double? kwhTariffCop,
     String? weeklyReportPhone,
+    String? cloudHost,
+    int? cloudPort,
+    String? cloudUsername,
+    String? cloudPassword,
+    bool? cloudUseTls,
   }) async {
     await _repository.updateSettings(
       host: host,
@@ -170,6 +180,11 @@ class SolarDashboardViewModel extends ChangeNotifier {
       alertMode: alertMode,
       kwhTariffCop: kwhTariffCop,
       weeklyReportPhone: weeklyReportPhone,
+      cloudHost: cloudHost,
+      cloudPort: cloudPort,
+      cloudUsername: cloudUsername,
+      cloudPassword: cloudPassword,
+      cloudUseTls: cloudUseTls,
     );
     notifyListeners();
   }

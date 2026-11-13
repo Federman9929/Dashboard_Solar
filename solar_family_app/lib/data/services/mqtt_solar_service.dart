@@ -46,6 +46,8 @@ class MqttDiagnosticsSnapshot {
     required this.lastPacketTime,
     required this.lastError,
     required this.steps,
+    this.isCloudConnection = false,
+    this.cloudConfigured = false,
   });
 
   final String targetHost;
@@ -57,18 +59,53 @@ class MqttDiagnosticsSnapshot {
   final DateTime? lastPacketTime;
   final String? lastError;
   final List<ConnectionStepInfo> steps;
+  final bool isCloudConnection;
+  final bool cloudConfigured;
 }
 
-/// Servicio de conectividad MQTT ultra-ligero y con diagnóstico paso a paso.
-/// Evita tormentas de reconexión usando un único temporizador controlado.
+class _MqttEndpoint {
+  const _MqttEndpoint({
+    required this.host,
+    required this.port,
+    required this.isCloud,
+    required this.useTls,
+    required this.username,
+    required this.password,
+    required this.tcpTimeout,
+  });
+
+  final String host;
+  final int port;
+  final bool isCloud;
+  final bool useTls;
+  final String username;
+  final String password;
+  final Duration tcpTimeout;
+
+  String get routeLabel => isCloud ? 'Nube TLS' : 'Red Local';
+}
+
+/// Servicio de conectividad MQTT ultra-ligero con failover automático:
+/// intenta primero la IP local en Wi-Fi (latencia 0) y, si cambia de router
+/// o está fuera de casa, conmuta automáticamente al broker seguro en la nube.
 class MqttSolarService {
   MqttServerClient? _client;
   Timer? _watchdogTimer;
   Timer? _reconnectTimer;
   StreamSubscription<List<MqttReceivedMessage<MqttMessage?>>?>? _updatesSub;
 
+  String _localHost = '192.168.0.224';
+  int _localPort = 1883;
+  String _cloudHost = '';
+  int _cloudPort = 8883;
+  String _cloudUsername = '';
+  String _cloudPassword = '';
+  bool _cloudUseTls = true;
+
   String _currentHost = '192.168.0.224';
   int _currentPort = 1883;
+  bool _usingCloud = false;
+
   bool _manualDisconnect = false;
   bool _isConnecting = false;
 
@@ -109,6 +146,7 @@ class MqttSolarService {
 
   MqttConnectionStateStatus _status = MqttConnectionStateStatus.disconnected;
   MqttConnectionStateStatus get status => _status;
+  bool get isUsingCloud => _usingCloud;
 
   MqttDiagnosticsSnapshot get currentDiagnostics => MqttDiagnosticsSnapshot(
         targetHost: _currentHost,
@@ -120,32 +158,35 @@ class MqttSolarService {
         lastPacketTime: _lastMessageReceivedAt,
         lastError: _lastError,
         steps: _steps.isEmpty ? _buildDefaultSteps() : _steps,
+        isCloudConnection: _usingCloud,
+        cloudConfigured: _cloudHost.isNotEmpty,
       );
 
   List<ConnectionStepInfo> _buildDefaultSteps() {
+    final route = _usingCloud ? 'Nube TLS' : 'Red Local';
     return [
       ConnectionStepInfo(
         stepNumber: 1,
-        title: '1. Verificación de Red Local',
+        title: '1. Verificación de Ruta ($route)',
         detail: 'Destino configurado: $_currentHost:$_currentPort',
         state: DiagnosticStepState.pending,
       ),
       ConnectionStepInfo(
         stepNumber: 2,
-        title: '2. Alcance TCP al Servidor (MacBook)',
+        title: '2. Alcance TCP al Servidor',
         detail: 'Probando puerto TCP $_currentPort en $_currentHost',
         state: DiagnosticStepState.pending,
       ),
       const ConnectionStepInfo(
         stepNumber: 3,
-        title: '3. Sesión con Broker Mosquitto MQTT',
+        title: '3. Sesión con Broker MQTT',
         detail: 'Esperando handshake de protocolo MQTT',
         state: DiagnosticStepState.pending,
       ),
       const ConnectionStepInfo(
         stepNumber: 4,
         title: '4. Suscripción a Canales del Inversor',
-        detail: 'Canales: telemetria (1s), historial_24h, alerta',
+        detail: 'Canales: telemetria (1s), historial_24h, alerta, ahorro',
         state: DiagnosticStepState.pending,
       ),
       const ConnectionStepInfo(
@@ -164,9 +205,7 @@ class MqttSolarService {
   }) {
     _currentStep = step;
     _steps = steps;
-    if (error != null) {
-      _lastError = error;
-    }
+    _lastError = error;
     if (!_diagnosticsController.isClosed) {
       _diagnosticsController.add(currentDiagnostics);
     }
@@ -175,42 +214,116 @@ class MqttSolarService {
   Future<void> connect({
     required String host,
     int port = 1883,
+    String? cloudHost,
+    int? cloudPort,
+    String? cloudUsername,
+    String? cloudPassword,
+    bool? cloudUseTls,
   }) async {
     if (_isConnecting) return;
     _isConnecting = true;
     _reconnectTimer?.cancel();
 
-    _currentHost = host.trim();
-    _currentPort = port;
-    _manualDisconnect = false;
+    _localHost = host.trim();
+    _localPort = port;
+    if (cloudHost != null) _cloudHost = cloudHost.trim();
+    if (cloudPort != null) _cloudPort = cloudPort;
+    if (cloudUsername != null) _cloudUsername = cloudUsername.trim();
+    if (cloudPassword != null) _cloudPassword = cloudPassword;
+    if (cloudUseTls != null) _cloudUseTls = cloudUseTls;
 
+    _manualDisconnect = false;
     await _cleanupExistingClient();
+
     _updateStatus(
       _reconnectAttempt > 0
           ? MqttConnectionStateStatus.reconnecting
           : MqttConnectionStateStatus.connecting,
     );
 
-    // PASO 1: Verificación de parámetros de red local
+    final hasCloud = _cloudHost.isNotEmpty;
+    final endpoints = <_MqttEndpoint>[
+      if (_localHost.isNotEmpty)
+        _MqttEndpoint(
+          host: _localHost,
+          port: _localPort,
+          isCloud: false,
+          useTls: false,
+          username: '',
+          password: '',
+          tcpTimeout: Duration(milliseconds: hasCloud ? 1100 : 2500),
+        ),
+      if (hasCloud)
+        _MqttEndpoint(
+          host: _cloudHost,
+          port: _cloudPort,
+          isCloud: true,
+          useTls: _cloudUseTls,
+          username: _cloudUsername,
+          password: _cloudPassword,
+          tcpTimeout: const Duration(milliseconds: 3000),
+        ),
+    ];
+
+    if (endpoints.isEmpty) {
+      _isConnecting = false;
+      _emitDiagnostics(
+        step: 1,
+        error: 'No hay servidor MQTT configurado.',
+        steps: _buildDefaultSteps(),
+      );
+      return;
+    }
+
+    for (var i = 0; i < endpoints.length; i++) {
+      final endpoint = endpoints[i];
+      final hasFallback = i + 1 < endpoints.length;
+      final connected = await _tryConnectEndpoint(
+        endpoint,
+        hasFallback: hasFallback,
+      );
+      if (connected || _manualDisconnect) {
+        _isConnecting = false;
+        return;
+      }
+    }
+
+    _isConnecting = false;
+    _scheduleControlledReconnect();
+  }
+
+  Future<void> reconnectUsingSavedEndpoints() async {
+    await connect(host: _localHost, port: _localPort);
+  }
+
+  Future<bool> _tryConnectEndpoint(
+    _MqttEndpoint endpoint, {
+    required bool hasFallback,
+  }) async {
+    _currentHost = endpoint.host;
+    _currentPort = endpoint.port;
+    _usingCloud = endpoint.isCloud;
+
+    // PASO 1 y 2: Prueba rápida de alcance TCP
     _emitDiagnostics(
-      step: 1,
+      step: 2,
       error: null,
       steps: [
         ConnectionStepInfo(
           stepNumber: 1,
-          title: '1. Verificación de Red Local',
-          detail: 'Conectando hacia $_currentHost:$_currentPort...',
+          title: '1. Verificación de Ruta (${endpoint.routeLabel})',
+          detail: 'Probando ${endpoint.host}:${endpoint.port}...',
           state: DiagnosticStepState.completed,
         ),
         ConnectionStepInfo(
           stepNumber: 2,
-          title: '2. Alcance TCP al Servidor (MacBook)',
-          detail: 'Abriendo socket TCP a $_currentHost:$_currentPort...',
+          title: '2. Alcance TCP (${endpoint.routeLabel})',
+          detail: 'Abriendo socket TCP a ${endpoint.host}:${endpoint.port}...',
           state: DiagnosticStepState.inProgress,
         ),
         const ConnectionStepInfo(
           stepNumber: 3,
-          title: '3. Sesión con Broker Mosquitto MQTT',
+          title: '3. Sesión con Broker MQTT',
           detail: 'Pendiente de conexión TCP',
           state: DiagnosticStepState.pending,
         ),
@@ -229,45 +342,51 @@ class MqttSolarService {
       ],
     );
 
-    // PASO 2: Prueba rápida de socket TCP para diagnosticar si la IP es alcanzable
     final sw = Stopwatch()..start();
     try {
       final testSocket = await Socket.connect(
-        _currentHost,
-        _currentPort,
-        timeout: const Duration(milliseconds: 2500),
+        endpoint.host,
+        endpoint.port,
+        timeout: endpoint.tcpTimeout,
       );
       await testSocket.close();
       sw.stop();
     } catch (e) {
       sw.stop();
-      _isConnecting = false;
-      final friendlyErr =
-          'No se alcanza la IP $_currentHost:$_currentPort (${e.runtimeType}). '
-          'Verifica que: (1) el celular y la Mac estén en el mismo Wi-Fi, '
-          '(2) la IP en Configuración (⚙️) sea la de tu Mac, y '
-          '(3) el servidor esté encendido en la Mac.';
+      if (hasFallback) {
+        _emitDiagnostics(
+          step: 2,
+          error:
+              'Red local $_localHost no disponible en este router; cambiando a Nube TLS...',
+          steps: _steps,
+        );
+        return false;
+      }
+      final friendlyErr = endpoint.isCloud
+          ? 'Sin conexión al broker Nube ${endpoint.host}:${endpoint.port} (${e.runtimeType}). Revisa tu acceso a internet o las credenciales.'
+          : 'No se alcanza la IP ${endpoint.host}:${endpoint.port} (${e.runtimeType}). '
+              'Si cambiaste de router o saliste de casa, configura Conexión Remota (Nube TLS) en Ajustes (⚙️).';
       _emitDiagnostics(
         step: 2,
         error: friendlyErr,
         steps: [
           ConnectionStepInfo(
             stepNumber: 1,
-            title: '1. Verificación de Red Local',
-            detail: 'Red activa en el dispositivo • Destino: $_currentHost',
+            title: '1. Verificación de Ruta (${endpoint.routeLabel})',
+            detail: 'Destino: ${endpoint.host}:${endpoint.port}',
             state: DiagnosticStepState.completed,
           ),
           ConnectionStepInfo(
             stepNumber: 2,
-            title: '2. Alcance TCP al Servidor (MacBook)',
+            title: '2. Alcance TCP (${endpoint.routeLabel})',
             detail:
-                'FALLÓ: Sin respuesta en $_currentHost:$_currentPort tras ${sw.elapsedMilliseconds}ms',
+                'FALLÓ: Sin respuesta en ${endpoint.host}:${endpoint.port} (${sw.elapsedMilliseconds}ms)',
             state: DiagnosticStepState.failed,
           ),
           const ConnectionStepInfo(
             stepNumber: 3,
-            title: '3. Sesión con Broker Mosquitto MQTT',
-            detail: 'Bloqueado por falta de alcance TCP en Paso 2',
+            title: '3. Sesión con Broker MQTT',
+            detail: 'Bloqueado por falta de alcance TCP',
             state: DiagnosticStepState.pending,
           ),
           const ConnectionStepInfo(
@@ -284,32 +403,33 @@ class MqttSolarService {
           ),
         ],
       );
-      _scheduleControlledReconnect();
-      return;
+      return false;
     }
 
     final tcpPingMs = sw.elapsedMilliseconds;
 
-    // PASO 3: Handshake MQTT con Mosquitto
+    // PASO 3: Handshake MQTT (plano local o TLS nube)
     _emitDiagnostics(
       step: 3,
       steps: [
         ConnectionStepInfo(
           stepNumber: 1,
-          title: '1. Verificación de Red Local',
-          detail: 'Red Wi-Fi lista • Destino: $_currentHost',
+          title: '1. Verificación de Ruta (${endpoint.routeLabel})',
+          detail: 'Ruta activa • Destino: ${endpoint.host}',
           state: DiagnosticStepState.completed,
         ),
         ConnectionStepInfo(
           stepNumber: 2,
-          title: '2. Alcance TCP al Servidor (MacBook)',
-          detail: 'Servidor alcanzado en ${tcpPingMs}ms (Puerto $_currentPort abierto)',
+          title: '2. Alcance TCP (${endpoint.routeLabel})',
+          detail: 'Alcanzado en ${tcpPingMs}ms (Puerto ${endpoint.port})',
           state: DiagnosticStepState.completed,
         ),
-        const ConnectionStepInfo(
+        ConnectionStepInfo(
           stepNumber: 3,
-          title: '3. Sesión con Broker Mosquitto MQTT',
-          detail: 'Negociando sesión MQTT con Mosquitto...',
+          title: '3. Sesión con Broker MQTT',
+          detail: endpoint.useTls
+              ? 'Negociando sesión TLS segura...'
+              : 'Negociando sesión MQTT con Mosquitto...',
           state: DiagnosticStepState.inProgress,
         ),
         const ConnectionStepInfo(
@@ -330,13 +450,20 @@ class MqttSolarService {
     final uniqueClientId =
         'solar_familia_${Random().nextInt(999999).toString().padLeft(6, '0')}';
 
-    final client =
-        MqttServerClient.withPort(_currentHost, uniqueClientId, _currentPort);
+    final client = MqttServerClient.withPort(
+      endpoint.host,
+      uniqueClientId,
+      endpoint.port,
+    );
     client.logging(on: false);
-    client.keepAlivePeriod = 15;
-    client.connectTimeoutPeriod = 3000;
-    // Desactivar autoReconnect interno para evitar tormentas exponenciales de timers
+    client.keepAlivePeriod = 10;
+    client.connectTimeoutPeriod = 3500;
     client.autoReconnect = false;
+
+    if (endpoint.useTls) {
+      client.secure = true;
+      client.securityContext = SecurityContext.defaultContext;
+    }
 
     client.onConnected = _onConnected;
     client.onDisconnected = _onDisconnected;
@@ -350,63 +477,70 @@ class MqttSolarService {
     _client = client;
 
     try {
-      await client.connect();
-    } catch (e) {
-      _isConnecting = false;
-      final errStr = 'Fallo en protocolo MQTT ($_currentHost:$_currentPort): $e';
-      _emitDiagnostics(
-        step: 3,
-        error: errStr,
-        steps: [
-          ConnectionStepInfo(
-            stepNumber: 1,
-            title: '1. Verificación de Red Local',
-            detail: 'Red Wi-Fi lista',
-            state: DiagnosticStepState.completed,
-          ),
-          ConnectionStepInfo(
-            stepNumber: 2,
-            title: '2. Alcance TCP al Servidor (MacBook)',
-            detail: 'Puerto $_currentPort abierto (${tcpPingMs}ms)',
-            state: DiagnosticStepState.completed,
-          ),
-          ConnectionStepInfo(
-            stepNumber: 3,
-            title: '3. Sesión con Broker Mosquitto MQTT',
-            detail: 'FALLÓ handshake MQTT: $e',
-            state: DiagnosticStepState.failed,
-          ),
-          const ConnectionStepInfo(
-            stepNumber: 4,
-            title: '4. Suscripción a Canales del Inversor',
-            detail: 'Pendiente',
-            state: DiagnosticStepState.pending,
-          ),
-          const ConnectionStepInfo(
-            stepNumber: 5,
-            title: '5. Flujo de Datos en Tiempo Real (1 seg)',
-            detail: 'Pendiente',
-            state: DiagnosticStepState.pending,
-          ),
-        ],
+      await client.connect(
+        endpoint.username.isEmpty ? null : endpoint.username,
+        endpoint.password.isEmpty ? null : endpoint.password,
       );
-      _scheduleControlledReconnect();
-      return;
+    } catch (e) {
+      await _cleanupExistingClient();
+      if (!hasFallback) {
+        _emitDiagnostics(
+          step: 3,
+          error:
+              'Fallo en protocolo MQTT (${endpoint.host}:${endpoint.port}): $e',
+          steps: [
+            ConnectionStepInfo(
+              stepNumber: 1,
+              title: '1. Verificación de Ruta (${endpoint.routeLabel})',
+              detail: 'Red activa',
+              state: DiagnosticStepState.completed,
+            ),
+            ConnectionStepInfo(
+              stepNumber: 2,
+              title: '2. Alcance TCP (${endpoint.routeLabel})',
+              detail: 'Puerto ${endpoint.port} abierto (${tcpPingMs}ms)',
+              state: DiagnosticStepState.completed,
+            ),
+            ConnectionStepInfo(
+              stepNumber: 3,
+              title: '3. Sesión con Broker MQTT',
+              detail: 'FALLÓ handshake MQTT: $e',
+              state: DiagnosticStepState.failed,
+            ),
+            const ConnectionStepInfo(
+              stepNumber: 4,
+              title: '4. Suscripción a Canales del Inversor',
+              detail: 'Pendiente',
+              state: DiagnosticStepState.pending,
+            ),
+            const ConnectionStepInfo(
+              stepNumber: 5,
+              title: '5. Flujo de Datos en Tiempo Real (1 seg)',
+              detail: 'Pendiente',
+              state: DiagnosticStepState.pending,
+            ),
+          ],
+        );
+      }
+      return false;
     }
-
-    _isConnecting = false;
 
     if (client.connectionStatus?.state == MqttConnectionState.connected) {
       _reconnectAttempt = 0;
       _lastError = null;
-      _setupSubscriptions(tcpPingMs: tcpPingMs);
+      _setupSubscriptions(tcpPingMs: tcpPingMs, endpoint: endpoint);
       _startWatchdog();
-    } else {
-      _scheduleControlledReconnect();
+      return true;
     }
+
+    await _cleanupExistingClient();
+    return false;
   }
 
-  void _setupSubscriptions({int tcpPingMs = 5}) {
+  void _setupSubscriptions({
+    required int tcpPingMs,
+    required _MqttEndpoint endpoint,
+  }) {
     final client = _client;
     if (client == null) return;
 
@@ -418,42 +552,14 @@ class MqttSolarService {
     _emitDiagnostics(
       step: 5,
       error: null,
-      steps: [
-        ConnectionStepInfo(
-          stepNumber: 1,
-          title: '1. Verificación de Red Local',
-          detail: 'Conectado a $_currentHost:$_currentPort',
-          state: DiagnosticStepState.completed,
-        ),
-        ConnectionStepInfo(
-          stepNumber: 2,
-          title: '2. Alcance TCP al Servidor (MacBook)',
-          detail: 'Latencia de red local: ${tcpPingMs}ms',
-          state: DiagnosticStepState.completed,
-        ),
-        const ConnectionStepInfo(
-          stepNumber: 3,
-          title: '3. Sesión con Broker Mosquitto MQTT',
-          detail: 'Sesión MQTT establecida y activa',
-          state: DiagnosticStepState.completed,
-        ),
-        const ConnectionStepInfo(
-          stepNumber: 4,
-          title: '4. Suscripción a Canales del Inversor',
-          detail: 'Suscrito a telemetria (1s), historial_24h y alerta',
-          state: DiagnosticStepState.completed,
-        ),
-        ConnectionStepInfo(
-          stepNumber: 5,
-          title: '5. Flujo de Datos en Tiempo Real (1 seg)',
-          detail: _packetsReceived > 0
-              ? 'Recibiendo datos cada 1s ($_packetsReceived paquetes)'
-              : 'Esperando primer paquete de solar_monitor.py...',
-          state: _packetsReceived > 0
-              ? DiagnosticStepState.completed
-              : DiagnosticStepState.inProgress,
-        ),
-      ],
+      steps: _buildConnectedSteps(
+        endpoint: endpoint,
+        tcpPingMs: tcpPingMs,
+        step5Detail: _packetsReceived > 0
+            ? 'Recibiendo datos cada 1s ($_packetsReceived paquetes)'
+            : 'Esperando primer paquete del servidor...',
+        step5Done: _packetsReceived > 0,
+      ),
     );
 
     _updatesSub?.cancel();
@@ -475,45 +581,18 @@ class MqttSolarService {
             final decoded = jsonDecode(payloadString) as Map<String, dynamic>;
             if (event.topic == topicTelemetry) {
               _telemetryController.add(decoded);
-              // Actualizar diagnóstico del paso 5 sin sobrecargar
               if (_packetsReceived == 1 || _packetsReceived % 5 == 0) {
                 final src = decoded['source_mode'] ?? 'Inversor';
                 _emitDiagnostics(
                   step: 5,
                   error: null,
-                  steps: [
-                    ConnectionStepInfo(
-                      stepNumber: 1,
-                      title: '1. Verificación de Red Local',
-                      detail: 'Conectado a $_currentHost:$_currentPort',
-                      state: DiagnosticStepState.completed,
-                    ),
-                    ConnectionStepInfo(
-                      stepNumber: 2,
-                      title: '2. Alcance TCP al Servidor (MacBook)',
-                      detail: 'Socket TCP estable en puerto $_currentPort',
-                      state: DiagnosticStepState.completed,
-                    ),
-                    const ConnectionStepInfo(
-                      stepNumber: 3,
-                      title: '3. Sesión con Broker Mosquitto MQTT',
-                      detail: 'Broker Mosquitto respondiendo OK',
-                      state: DiagnosticStepState.completed,
-                    ),
-                    const ConnectionStepInfo(
-                      stepNumber: 4,
-                      title: '4. Suscripción a Canales del Inversor',
-                      detail: 'Canales activos: telemetria, historial_24h',
-                      state: DiagnosticStepState.completed,
-                    ),
-                    ConnectionStepInfo(
-                      stepNumber: 5,
-                      title: '5. Flujo de Datos en Tiempo Real (1 seg)',
-                      detail:
-                          'Activo • $_packetsReceived lecturas recibidas ($src)',
-                      state: DiagnosticStepState.completed,
-                    ),
-                  ],
+                  steps: _buildConnectedSteps(
+                    endpoint: endpoint,
+                    tcpPingMs: tcpPingMs,
+                    step5Detail:
+                        'Activo (${endpoint.routeLabel}) • $_packetsReceived lecturas ($src)',
+                    step5Done: true,
+                  ),
                 );
               }
             } else if (event.topic == topicHistory) {
@@ -537,6 +616,50 @@ class MqttSolarService {
     sendCommand('GET_HISTORY');
   }
 
+  List<ConnectionStepInfo> _buildConnectedSteps({
+    required _MqttEndpoint endpoint,
+    required int tcpPingMs,
+    required String step5Detail,
+    required bool step5Done,
+  }) {
+    return [
+      ConnectionStepInfo(
+        stepNumber: 1,
+        title: '1. Verificación de Ruta (${endpoint.routeLabel})',
+        detail: 'Conectado a ${endpoint.host}:${endpoint.port}',
+        state: DiagnosticStepState.completed,
+      ),
+      ConnectionStepInfo(
+        stepNumber: 2,
+        title: '2. Alcance TCP (${endpoint.routeLabel})',
+        detail: 'Latencia de red: ${tcpPingMs}ms',
+        state: DiagnosticStepState.completed,
+      ),
+      ConnectionStepInfo(
+        stepNumber: 3,
+        title: '3. Sesión con Broker MQTT',
+        detail: endpoint.useTls
+            ? 'Sesión TLS segura establecida'
+            : 'Sesión MQTT local establecida',
+        state: DiagnosticStepState.completed,
+      ),
+      const ConnectionStepInfo(
+        stepNumber: 4,
+        title: '4. Suscripción a Canales del Inversor',
+        detail: 'Canales: telemetria (1s), historial_24h, alerta, ahorro',
+        state: DiagnosticStepState.completed,
+      ),
+      ConnectionStepInfo(
+        stepNumber: 5,
+        title: '5. Flujo de Datos en Tiempo Real (1 seg)',
+        detail: step5Detail,
+        state: step5Done
+            ? DiagnosticStepState.completed
+            : DiagnosticStepState.inProgress,
+      ),
+    ];
+  }
+
   void sendCommand(String command) {
     final client = _client;
     if (client?.connectionStatus?.state != MqttConnectionState.connected) {
@@ -553,15 +676,15 @@ class MqttSolarService {
 
   void _startWatchdog() {
     _watchdogTimer?.cancel();
-    _watchdogTimer = Timer.periodic(const Duration(seconds: 8), (_) {
+    _watchdogTimer = Timer.periodic(const Duration(seconds: 4), (_) {
       if (_manualDisconnect || _isConnecting) return;
       final lastRx = _lastMessageReceivedAt;
       if (lastRx != null &&
-          DateTime.now().difference(lastRx).inSeconds > 15 &&
+          DateTime.now().difference(lastRx).inSeconds > 7 &&
           _status == MqttConnectionStateStatus.connected) {
         _lastError =
-            'El broker MQTT está conectado pero solar_monitor.py no envió datos en 15s.';
-        connect(host: _currentHost, port: _currentPort);
+            'Sin paquetes durante >7s; reconectando automáticamente...';
+        reconnectUsingSavedEndpoints();
       }
     });
   }
@@ -585,12 +708,12 @@ class MqttSolarService {
     _reconnectAttempt++;
     _updateStatus(MqttConnectionStateStatus.reconnecting);
 
-    // Backoff suave de 3 segundos (un único timer activo a la vez)
-    _reconnectTimer = Timer(const Duration(seconds: 3), () {
+    final delayMs = _reconnectAttempt <= 2 ? 1500 : 3000;
+    _reconnectTimer = Timer(Duration(milliseconds: delayMs), () {
       if (!_manualDisconnect &&
           _status != MqttConnectionStateStatus.connected &&
           !_isConnecting) {
-        connect(host: _currentHost, port: _currentPort);
+        reconnectUsingSavedEndpoints();
       }
     });
   }

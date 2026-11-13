@@ -26,6 +26,11 @@ class SolarRepository {
 
   static const String _prefBrokerHost = 'mqtt_broker_host';
   static const String _prefBrokerPort = 'mqtt_broker_port';
+  static const String _prefCloudHost = 'cloud_mqtt_host';
+  static const String _prefCloudPort = 'cloud_mqtt_port';
+  static const String _prefCloudUser = 'cloud_mqtt_user';
+  static const String _prefCloudPass = 'cloud_mqtt_pass';
+  static const String _prefCloudTls = 'cloud_mqtt_tls';
   static const String _prefTelegramToken = 'telegram_bot_token';
   static const String _prefTelegramChatId = 'telegram_chat_id';
   static const String _prefDemoMode = 'demo_mode_enabled';
@@ -38,6 +43,12 @@ class SolarRepository {
 
   String _brokerHost = '192.168.0.224';
   int _brokerPort = 1883;
+  String _cloudHost = '';
+  int _cloudPort = 8883;
+  String _cloudUsername = '';
+  String _cloudPassword = '';
+  bool _cloudUseTls = true;
+  bool _pendingCloudConfigSync = false;
   String _telegramBotToken = '';
   String _telegramChatId = '';
   bool _demoMode = false;
@@ -49,6 +60,11 @@ class SolarRepository {
 
   String get brokerHost => _brokerHost;
   int get brokerPort => _brokerPort;
+  String get cloudHost => _cloudHost;
+  int get cloudPort => _cloudPort;
+  String get cloudUsername => _cloudUsername;
+  String get cloudPassword => _cloudPassword;
+  bool get cloudUseTls => _cloudUseTls;
   String get telegramBotToken => _telegramBotToken;
   String get telegramChatId => _telegramChatId;
   bool get demoMode => _demoMode;
@@ -122,6 +138,11 @@ class SolarRepository {
     final prefs = await SharedPreferences.getInstance();
     _brokerHost = prefs.getString(_prefBrokerHost) ?? '192.168.0.224';
     _brokerPort = prefs.getInt(_prefBrokerPort) ?? 1883;
+    _cloudHost = prefs.getString(_prefCloudHost) ?? '';
+    _cloudPort = prefs.getInt(_prefCloudPort) ?? 8883;
+    _cloudUsername = prefs.getString(_prefCloudUser) ?? '';
+    _cloudPassword = prefs.getString(_prefCloudPass) ?? '';
+    _cloudUseTls = prefs.getBool(_prefCloudTls) ?? true;
     _telegramBotToken = prefs.getString(_prefTelegramToken) ?? '';
     _telegramChatId = prefs.getString(_prefTelegramChatId) ?? '';
     _demoMode = prefs.getBool(_prefDemoMode) ?? false;
@@ -225,11 +246,44 @@ class SolarRepository {
       unawaited(_persistStatsCache(bundle));
     });
 
+    _mqttService.connectionStream.listen((status) {
+      if (status == MqttConnectionStateStatus.connected &&
+          _pendingCloudConfigSync &&
+          !_mqttService.isUsingCloud) {
+        _pendingCloudConfigSync = false;
+        _sendCloudConfigCommand();
+      }
+    });
+
     if (_demoMode) {
       _startLocalDemoStream();
     } else {
-      await _mqttService.connect(host: _brokerHost, port: _brokerPort);
+      await _connectMqtt();
     }
+  }
+
+  Future<void> _connectMqtt() {
+    return _mqttService.connect(
+      host: _brokerHost,
+      port: _brokerPort,
+      cloudHost: _cloudHost,
+      cloudPort: _cloudPort,
+      cloudUsername: _cloudUsername,
+      cloudPassword: _cloudPassword,
+      cloudUseTls: _cloudUseTls,
+    );
+  }
+
+  void _sendCloudConfigCommand() {
+    _mqttService.sendCommand(
+      'SET_CLOUD_CONFIG:${jsonEncode({
+            'host': _cloudHost,
+            'port': _cloudPort,
+            'user': _cloudUsername,
+            'pass': _cloudPassword,
+            'tls': _cloudUseTls,
+          })}',
+    );
   }
 
   String _todayDateKey() {
@@ -461,7 +515,7 @@ class SolarRepository {
 
   Future<void> retryConnectionNow() async {
     if (_demoMode) return;
-    await _mqttService.connect(host: _brokerHost, port: _brokerPort);
+    await _connectMqtt();
   }
 
   Future<void> simulateCriticalAlertTest() async {
@@ -518,9 +572,19 @@ class SolarRepository {
     BatteryAlertMode? alertMode,
     double? kwhTariffCop,
     String? weeklyReportPhone,
+    String? cloudHost,
+    int? cloudPort,
+    String? cloudUsername,
+    String? cloudPassword,
+    bool? cloudUseTls,
   }) async {
     _brokerHost = host.trim();
     _brokerPort = port;
+    if (cloudHost != null) _cloudHost = cloudHost.trim();
+    if (cloudPort != null) _cloudPort = cloudPort;
+    if (cloudUsername != null) _cloudUsername = cloudUsername.trim();
+    if (cloudPassword != null) _cloudPassword = cloudPassword;
+    if (cloudUseTls != null) _cloudUseTls = cloudUseTls;
     _telegramBotToken = telegramToken.trim();
     _telegramChatId = telegramChatId.trim();
     _demoMode = demoMode;
@@ -540,6 +604,11 @@ class SolarRepository {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_prefBrokerHost, _brokerHost);
     await prefs.setInt(_prefBrokerPort, _brokerPort);
+    await prefs.setString(_prefCloudHost, _cloudHost);
+    await prefs.setInt(_prefCloudPort, _cloudPort);
+    await prefs.setString(_prefCloudUser, _cloudUsername);
+    await prefs.setString(_prefCloudPass, _cloudPassword);
+    await prefs.setBool(_prefCloudTls, _cloudUseTls);
     await prefs.setString(_prefTelegramToken, _telegramBotToken);
     await prefs.setString(_prefTelegramChatId, _telegramChatId);
     await prefs.setBool(_prefDemoMode, _demoMode);
@@ -560,13 +629,24 @@ class SolarRepository {
     _mqttService.sendCommand(
       'SET_REPORT_CONFIG:{"phone":"$_weeklyReportPhone","tariff":$_kwhTariffCop}',
     );
+    if (cloudHost != null ||
+        cloudUsername != null ||
+        cloudPassword != null ||
+        cloudPort != null) {
+      _pendingCloudConfigSync = true;
+      if (_mqttService.status == MqttConnectionStateStatus.connected &&
+          !_mqttService.isUsingCloud) {
+        _pendingCloudConfigSync = false;
+        _sendCloudConfigCommand();
+      }
+    }
 
     _demoTimer?.cancel();
     if (_demoMode) {
       await _mqttService.disconnectManual();
       _startLocalDemoStream();
     } else {
-      await _mqttService.connect(host: _brokerHost, port: _brokerPort);
+      await _connectMqtt();
     }
   }
 

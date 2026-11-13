@@ -1,4 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:solar_family_monitor/data/services/mqtt_solar_service.dart';
 import 'package:solar_family_monitor/domain/models/battery_alert_mode.dart';
 import 'package:solar_family_monitor/domain/models/solar_energy_stats.dart';
 import 'package:solar_family_monitor/domain/models/solar_reading.dart';
@@ -68,5 +69,27 @@ void main() {
     );
     // (70 - 30) * 49.1 Wh = 1964 Wh / 491 W = 4h 00m
     expect(discharging.estimateAutonomy(threshold: 30.0), '4h 00m hasta 30%');
+  });
+
+  test('MqttSolarService intenta failover automático a broker Nube si falla red local', () async {
+    final service = MqttSolarService();
+    // Usar puertos locales cerrados para verificar que intenta local y luego conmuta a nube
+    await service.connect(
+      host: '127.0.0.1',
+      port: 39881,
+      cloudHost: '127.0.0.1',
+      cloudPort: 39882,
+      cloudUsername: 'u',
+      cloudPassword: 'p',
+      cloudUseTls: true,
+    );
+
+    final diag = service.currentDiagnostics;
+    expect(diag.cloudConfigured, isTrue);
+    expect(diag.isCloudConnection, isTrue);
+    expect(diag.targetHost, '127.0.0.1');
+    expect(diag.targetPort, 39882);
+
+    await service.dispose();
   });
 }

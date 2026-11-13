@@ -276,10 +276,9 @@ class SolarDashboardScreen extends StatelessWidget {
     final (String label, Color color) = demoMode
         ? ('MODO DEMO', const Color(0xFF448AFF))
         : switch (status) {
-            MqttConnectionStateStatus.connected => (
-                'EN LÍNEA (1s)',
-                const Color(0xFF00E676)
-              ),
+            MqttConnectionStateStatus.connected => diagnostics.isCloudConnection
+                ? ('EN LÍNEA • NUBE', const Color(0xFF40C4FF))
+                : ('EN LÍNEA (1s)', const Color(0xFF00E676)),
             MqttConnectionStateStatus.connecting ||
             MqttConnectionStateStatus.reconnecting =>
               (
@@ -404,7 +403,7 @@ class SolarDashboardScreen extends StatelessWidget {
                           Text(
                             isDemo
                                 ? 'Modo actual: Simulador Local en Celular'
-                                : 'Servidor destino: ${diag.targetHost}:${diag.targetPort}',
+                                : 'Ruta (${diag.isCloudConnection ? 'Nube TLS' : 'Local'}): ${diag.targetHost}:${diag.targetPort}',
                             style: const TextStyle(
                               color: Colors.white,
                               fontSize: 12,
@@ -1047,6 +1046,11 @@ class SolarDashboardScreen extends StatelessWidget {
     final hostCtrl = TextEditingController(text: viewModel.brokerHost);
     final portCtrl =
         TextEditingController(text: viewModel.brokerPort.toString());
+    final cloudHostCtrl = TextEditingController(text: viewModel.cloudHost);
+    final cloudPortCtrl =
+        TextEditingController(text: viewModel.cloudPort.toString());
+    final cloudUserCtrl = TextEditingController(text: viewModel.cloudUsername);
+    final cloudPassCtrl = TextEditingController(text: viewModel.cloudPassword);
     final tgTokenCtrl = TextEditingController(text: viewModel.telegramBotToken);
     final tgChatCtrl = TextEditingController(text: viewModel.telegramChatId);
     final tariffCtrl =
@@ -1054,6 +1058,7 @@ class SolarDashboardScreen extends StatelessWidget {
     final reportPhoneCtrl =
         TextEditingController(text: viewModel.weeklyReportPhone);
     bool demoMode = viewModel.demoMode;
+    bool cloudUseTls = viewModel.cloudUseTls;
     double threshold = viewModel.criticalSocThreshold;
     BatteryAlertMode alertMode = viewModel.alertMode;
 
@@ -1207,12 +1212,90 @@ class SolarDashboardScreen extends StatelessWidget {
                       keyboardType: TextInputType.number,
                       style: const TextStyle(color: Colors.white),
                       decoration: const InputDecoration(
-                        labelText: 'Puerto MQTT',
+                        labelText: 'Puerto MQTT Local',
                         hintText: '1883',
                         labelStyle: TextStyle(color: Colors.white70),
                       ),
                     ),
-                    const SizedBox(height: 12),
+                    const Divider(color: Colors.white12, height: 24),
+                    const Text(
+                      'Conexión Remota (Otro router / Fuera de casa)',
+                      style: TextStyle(
+                        color: Color(0xFF40C4FF),
+                        fontSize: 13,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
+                          flex: 3,
+                          child: TextField(
+                            controller: cloudHostCtrl,
+                            style: const TextStyle(color: Colors.white),
+                            decoration: const InputDecoration(
+                              labelText: 'Broker Nube (HiveMQ / EMQX)',
+                              hintText: 'xxxx.s1.eu.hivemq.cloud',
+                              labelStyle: TextStyle(color: Colors.white70),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          flex: 1,
+                          child: TextField(
+                            controller: cloudPortCtrl,
+                            keyboardType: TextInputType.number,
+                            style: const TextStyle(color: Colors.white),
+                            decoration: const InputDecoration(
+                              labelText: 'Puerto',
+                              hintText: '8883',
+                              labelStyle: TextStyle(color: Colors.white70),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: cloudUserCtrl,
+                            style: const TextStyle(color: Colors.white),
+                            decoration: const InputDecoration(
+                              labelText: 'Usuario Nube',
+                              labelStyle: TextStyle(color: Colors.white70),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: TextField(
+                            controller: cloudPassCtrl,
+                            obscureText: true,
+                            style: const TextStyle(color: Colors.white),
+                            decoration: const InputDecoration(
+                              labelText: 'Contraseña Nube',
+                              labelStyle: TextStyle(color: Colors.white70),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text(
+                        'Cifrado TLS (puerto 8883)',
+                        style: TextStyle(color: Colors.white70, fontSize: 13),
+                      ),
+                      value: cloudUseTls,
+                      activeColor: const Color(0xFF40C4FF),
+                      onChanged: (val) =>
+                          setSheetState(() => cloudUseTls = val),
+                    ),
+                    const Divider(color: Colors.white12, height: 16),
                     TextField(
                       controller: tgTokenCtrl,
                       style: const TextStyle(color: Colors.white),
@@ -1248,8 +1331,14 @@ class SolarDashboardScreen extends StatelessWidget {
                             demoMode: demoMode,
                             criticalThreshold: threshold,
                             alertMode: alertMode,
-                            kwhTariffCop: double.tryParse(tariffCtrl.text) ?? 850.0,
+                            kwhTariffCop:
+                                double.tryParse(tariffCtrl.text) ?? 850.0,
                             weeklyReportPhone: reportPhoneCtrl.text,
+                            cloudHost: cloudHostCtrl.text,
+                            cloudPort: int.tryParse(cloudPortCtrl.text) ?? 8883,
+                            cloudUsername: cloudUserCtrl.text,
+                            cloudPassword: cloudPassCtrl.text,
+                            cloudUseTls: cloudUseTls,
                           );
                           Navigator.of(ctx).pop();
                         },

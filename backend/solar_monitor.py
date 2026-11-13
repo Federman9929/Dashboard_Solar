@@ -17,6 +17,7 @@ import random
 import signal
 import socket
 import sqlite3
+import ssl
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -552,7 +553,11 @@ class CriticalAlertManager:
         self.callmebot_user = os.getenv("CALLMEBOT_USER", "")
 
     def check_and_trigger(
-        self, telemetry: SolarTelemetry, mqtt_client: mqtt.Client, alert_topic: str
+        self,
+        telemetry: SolarTelemetry,
+        mqtt_client: mqtt.Client,
+        alert_topic: str,
+        publish_fn=None,
     ) -> None:
         if telemetry.battery_soc >= self.threshold_soc:
             return
@@ -572,7 +577,7 @@ class CriticalAlertManager:
         logger.warning(f"Disparando alerta crítica de batería (< {self.threshold_soc}%): {telemetry.battery_soc}%")
 
         # 1. Publicar evento en el tópico de alerta MQTT para que todos los celulares en casa
-        # disparen la sirena de emergencia tipo llamada entrante inmediatamente
+        # y remotos disparen la alerta inmediatamente
         alert_payload = {
             "timestamp": telemetry.timestamp,
             "epoch_ms": telemetry.epoch_ms,
@@ -583,7 +588,11 @@ class CriticalAlertManager:
             "battery_voltage": telemetry.battery_voltage,
             "battery_discharge_w": telemetry.battery_discharge_w,
         }
-        mqtt_client.publish(alert_topic, json.dumps(alert_payload), qos=1, retain=False)
+        payload_str = json.dumps(alert_payload)
+        if publish_fn is not None:
+            publish_fn(alert_topic, payload_str, qos=1, retain=False)
+        else:
+            mqtt_client.publish(alert_topic, payload_str, qos=1, retain=False)
 
         # 2. Enviar mensaje prioritario por Telegram Bot API (si está configurado)
         if self.telegram_enabled and self.telegram_token and self.telegram_chat_id:
@@ -978,7 +987,7 @@ class SolarBackendService:
         )
         self._last_weekly_report_date = ""
 
-        # Cliente MQTT (Compatible con paho-mqtt v2)
+        # Cliente MQTT local (Compatible con paho-mqtt v2)
         self.mqtt_client = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2,
             client_id="macbook_solar_publisher",
@@ -989,25 +998,145 @@ class SolarBackendService:
         self.mqtt_client.on_message = self._on_mqtt_message
         self.mqtt_client.reconnect_delay_set(min_delay=1, max_delay=10)
 
+        # Cliente MQTT en la nube (opcional: HiveMQ Cloud / EMQX TLS para acceso remoto)
+        self.cloud_mqtt_client: Optional[mqtt.Client] = None
+        self.cloud_connected = False
+        self.cloud_config = self._load_cloud_config()
+
         self._last_history_save_time = 0.0
         self._last_history_publish_time = 0.0
+        self._last_cloud_history_publish_time = 0.0
         self._last_stats_publish_time = 0.0
         self._last_telemetry_integrate_time = time.time()
         self._live_extra_pv_kwh = 0.0
         self._live_extra_load_kwh = 0.0
+
+    def _load_cloud_config(self) -> Dict[str, Any]:
+        env_host = os.getenv("CLOUD_MQTT_HOST", "").strip()
+        if env_host:
+            return {
+                "host": env_host,
+                "port": int(os.getenv("CLOUD_MQTT_PORT", "8883") or "8883"),
+                "user": os.getenv("CLOUD_MQTT_USER", "").strip(),
+                "pass": os.getenv("CLOUD_MQTT_PASS", "").strip(),
+                "tls": os.getenv("CLOUD_MQTT_TLS", "true").lower() == "true",
+            }
+        raw_meta = self.db.get_meta("cloud_mqtt_config", "")
+        if raw_meta:
+            try:
+                cfg = json.loads(raw_meta)
+                if isinstance(cfg, dict) and str(cfg.get("host", "")).strip():
+                    return {
+                        "host": str(cfg.get("host", "")).strip(),
+                        "port": int(cfg.get("port", 8883) or 8883),
+                        "user": str(cfg.get("user", "")).strip(),
+                        "pass": str(cfg.get("pass", "")).strip(),
+                        "tls": bool(cfg.get("tls", True)),
+                    }
+            except Exception as exc:
+                logger.warning(f"No se pudo leer cloud_mqtt_config de BD: {exc}")
+        return {"host": "", "port": 8883, "user": "", "pass": "", "tls": True}
+
+    def _connect_cloud_mqtt(self) -> None:
+        self._disconnect_cloud_mqtt()
+        host = str(self.cloud_config.get("host", "")).strip()
+        if not host:
+            return
+        port = int(self.cloud_config.get("port", 8883) or 8883)
+        user = str(self.cloud_config.get("user", "")).strip()
+        password = str(self.cloud_config.get("pass", "")).strip()
+        use_tls = bool(self.cloud_config.get("tls", True))
+
+        client = mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION2,
+            client_id=f"macbook_solar_cloud_{os.getpid()}",
+            clean_session=True,
+        )
+        if user:
+            client.username_pw_set(user, password or None)
+        if use_tls:
+            try:
+                import certifi
+                ca_path = certifi.where()
+            except Exception:
+                ca_path = None
+            client.tls_set(
+                ca_certs=ca_path,
+                cert_reqs=ssl.CERT_REQUIRED,
+                tls_version=ssl.PROTOCOL_TLS,
+            )
+        client.on_connect = self._on_cloud_mqtt_connect
+        client.on_disconnect = self._on_cloud_mqtt_disconnect
+        client.on_message = self._on_mqtt_message
+        client.reconnect_delay_set(min_delay=2, max_delay=30)
+
+        self.cloud_mqtt_client = client
+        try:
+            client.connect_async(host, port, keepalive=30)
+            client.loop_start()
+            logger.info(f"Iniciando puente MQTT hacia la nube {host}:{port} (TLS={use_tls})...")
+        except Exception as exc:
+            logger.warning(f"No se pudo iniciar cliente MQTT en la nube ({host}:{port}): {exc}")
+
+    def _disconnect_cloud_mqtt(self) -> None:
+        self.cloud_connected = False
+        old = self.cloud_mqtt_client
+        self.cloud_mqtt_client = None
+        if old is not None:
+            try:
+                old.loop_stop()
+                old.disconnect()
+            except Exception:
+                pass
+
+    def _publish_all(
+        self,
+        topic: str,
+        payload: str,
+        qos: int = 1,
+        retain: bool = False,
+        include_cloud: bool = True,
+    ) -> None:
+        try:
+            self.mqtt_client.publish(topic, payload, qos=qos, retain=retain)
+        except Exception as exc:
+            logger.debug(f"Error publicando en broker local ({topic}): {exc}")
+
+        if include_cloud and self.cloud_mqtt_client is not None and self.cloud_connected:
+            try:
+                self.cloud_mqtt_client.publish(topic, payload, qos=qos, retain=retain)
+            except Exception as exc:
+                logger.debug(f"Error publicando en broker nube ({topic}): {exc}")
 
     def _on_mqtt_connect(self, client, userdata, flags, reason_code, properties):
         if reason_code == 0:
             logger.info(f"Conectado exitosamente al Broker MQTT local en {self.mqtt_host}:{self.mqtt_port}")
             # Suscribirse a comandos desde la app móvil (ej. solicitud de historial o prueba de alerta)
             client.subscribe("hogar/solar/comando", qos=1)
-            self._publish_24h_history()
+            self._publish_24h_history(include_cloud=False)
             self._publish_energy_stats()
         else:
-            logger.error(f"Fallo al conectar a MQTT, código: {reason_code}")
+            logger.error(f"Fallo al conectar a MQTT local, código: {reason_code}")
 
     def _on_mqtt_disconnect(self, client, userdata, flags, reason_code, properties):
-        logger.warning(f"Desconectado del Broker MQTT (código: {reason_code}). Reintentando automáticamente...")
+        logger.warning(f"Desconectado del Broker MQTT local (código: {reason_code}). Reintentando automáticamente...")
+
+    def _on_cloud_mqtt_connect(self, client, userdata, flags, reason_code, properties):
+        if reason_code == 0:
+            self.cloud_connected = True
+            host = self.cloud_config.get("host", "")
+            port = self.cloud_config.get("port", 8883)
+            logger.info(f"☁️ Conectado al Broker MQTT en la nube: {host}:{port}")
+            client.subscribe("hogar/solar/comando", qos=1)
+            self._publish_24h_history(include_cloud=True)
+            self._publish_energy_stats()
+        else:
+            self.cloud_connected = False
+            logger.error(f"Fallo al conectar al Broker MQTT nube, código: {reason_code}")
+
+    def _on_cloud_mqtt_disconnect(self, client, userdata, flags, reason_code, properties):
+        self.cloud_connected = False
+        logger.warning(f"Desconectado del Broker MQTT nube (código: {reason_code}). Reintentando...")
 
     def _on_mqtt_message(self, client, userdata, msg):
         """Permite a la app Flutter pedir el historial bajo demanda o simular una alerta crítica."""
@@ -1036,6 +1165,28 @@ class SolarBackendService:
                     f"Configuración de informe actualizada: Tel/ID={self.weekly_report_recipient}, Tarifa=${self.tariff_cop} COP"
                 )
                 self._publish_energy_stats()
+            elif payload.startswith("SET_CLOUD_CONFIG:"):
+                cfg = json.loads(payload.split(":", 1)[1])
+                host = str(cfg.get("host", "")).strip()
+                port = int(cfg.get("port", 8883) or 8883)
+                user = str(cfg.get("user", "")).strip()
+                password = str(cfg.get("pass", "")).strip()
+                use_tls = bool(cfg.get("tls", True))
+                clean_cfg = {
+                    "host": host,
+                    "port": port,
+                    "user": user,
+                    "pass": password,
+                    "tls": use_tls,
+                }
+                self.db.set_meta("cloud_mqtt_config", json.dumps(clean_cfg))
+                if not os.getenv("CLOUD_MQTT_HOST", "").strip():
+                    self.cloud_config = clean_cfg
+                    if host:
+                        self._connect_cloud_mqtt()
+                    else:
+                        self._disconnect_cloud_mqtt()
+                logger.info(f"☁️ Configuración MQTT Nube actualizada desde App: {host or '(desactivado)'}:{port}")
             elif payload == "TEST_CRITICAL_ALERT":
                 # Permite probar el sistema de alerta crítica desde la app móvil
                 sample = self.reader.read_telemetry()
@@ -1044,7 +1195,12 @@ class SolarBackendService:
                 sample.battery_discharge_w = 1450.0
                 sample.is_critical = True
                 self.alert_manager.last_alert_time = 0.0
-                self.alert_manager.check_and_trigger(sample, self.mqtt_client, self.topic_alert)
+                self.alert_manager.check_and_trigger(
+                    sample,
+                    self.mqtt_client,
+                    self.topic_alert,
+                    publish_fn=self._publish_all,
+                )
         except Exception as exc:
             logger.error(f"Error procesando comando MQTT: {exc}")
 
@@ -1060,7 +1216,7 @@ class SolarBackendService:
         today_str = datetime.now().strftime("%Y-%m-%d")
         return daily_totals.get(today_str, {})
 
-    def _publish_24h_history(self) -> None:
+    def _publish_24h_history(self, include_cloud: bool = True) -> None:
         if self.mode == "SMARTESS_CLOUD":
             cloud_client = getattr(self.reader, "_smartess_client", None)
             if cloud_client is not None:
@@ -1077,7 +1233,13 @@ class SolarBackendService:
         )
         # Publicar con retain=True para que cualquier celular que abra la app
         # reciba instantáneamente la curva de las últimas 24 horas
-        self.mqtt_client.publish(self.topic_history, payload, qos=1, retain=True)
+        self._publish_all(
+            self.topic_history,
+            payload,
+            qos=1,
+            retain=True,
+            include_cloud=include_cloud,
+        )
         logger.info(f"Historial de 24h publicado en {self.topic_history} ({len(history_points)} puntos)")
 
     def _publish_energy_stats(self, quiet: bool = False) -> None:
@@ -1091,7 +1253,7 @@ class SolarBackendService:
             cloud_start_time=str(today_cloud.get("solar_start_time", "")),
         )
         payload = json.dumps(stats)
-        self.mqtt_client.publish(self.topic_stats, payload, qos=1, retain=True)
+        self._publish_all(self.topic_stats, payload, qos=1, retain=True)
         if not quiet:
             logger.info(
                 f"Estadísticas publicadas en {self.topic_stats}: "
@@ -1196,6 +1358,9 @@ class SolarBackendService:
                 logger.warning(f"Esperando al broker Mosquitto en {self.mqtt_host}:{self.mqtt_port} ({exc})...")
                 time.sleep(3)
 
+        if self.cloud_config.get("host"):
+            self._connect_cloud_mqtt()
+
         import threading
         threading.Thread(target=self._sync_real_cloud_history_once, daemon=True).start()
 
@@ -1206,10 +1371,15 @@ class SolarBackendService:
                 payload_str = json.dumps(asdict(telemetry))
 
                 # Publicar lectura en tiempo real (QoS 1 y retain=True para estado inmediato)
-                self.mqtt_client.publish(self.topic_telemetry, payload_str, qos=1, retain=True)
+                self._publish_all(self.topic_telemetry, payload_str, qos=1, retain=True)
 
                 # Verificar si la batería bajó del umbral configurado
-                self.alert_manager.check_and_trigger(telemetry, self.mqtt_client, self.topic_alert)
+                self.alert_manager.check_and_trigger(
+                    telemetry,
+                    self.mqtt_client,
+                    self.topic_alert,
+                    publish_fn=self._publish_all,
+                )
 
                 # Integrar energía en vivo segundo a segundo entre guardados de BD
                 now = time.time()
@@ -1231,7 +1401,10 @@ class SolarBackendService:
                     self._last_stats_publish_time = now
 
                 if (now - self._last_history_publish_time) >= 60.0:
-                    self._publish_24h_history()
+                    push_cloud_history = (now - self._last_cloud_history_publish_time) >= 300.0
+                    self._publish_24h_history(include_cloud=push_cloud_history)
+                    if push_cloud_history:
+                        self._last_cloud_history_publish_time = now
                     self._publish_energy_stats(quiet=False)
                     self._check_weekly_report_schedule()
                     self._last_history_publish_time = now
@@ -1246,6 +1419,7 @@ class SolarBackendService:
     def stop(self, *args) -> None:
         logger.info("Deteniendo Servicio Solar Local de forma segura...")
         self.running = False
+        self._disconnect_cloud_mqtt()
         try:
             self.mqtt_client.loop_stop()
             self.mqtt_client.disconnect()
