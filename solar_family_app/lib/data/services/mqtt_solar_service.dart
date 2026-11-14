@@ -48,6 +48,8 @@ class MqttDiagnosticsSnapshot {
     required this.steps,
     this.isCloudConnection = false,
     this.cloudConfigured = false,
+    this.isServerLive = true,
+    this.lastTelemetryEpochMs,
   });
 
   final String targetHost;
@@ -61,6 +63,8 @@ class MqttDiagnosticsSnapshot {
   final List<ConnectionStepInfo> steps;
   final bool isCloudConnection;
   final bool cloudConfigured;
+  final bool isServerLive;
+  final int? lastTelemetryEpochMs;
 }
 
 class _MqttEndpoint {
@@ -110,6 +114,10 @@ class MqttSolarService {
   bool _isConnecting = false;
 
   DateTime? _lastMessageReceivedAt;
+  DateTime? _lastFreshTelemetryAt;
+  int? _lastTelemetryEpochMs;
+  String? _lastHistoryGeneratedAt;
+  int _watchdogTicks = 0;
   int _reconnectAttempt = 0;
   int _packetsReceived = 0;
   String? _lastError;
@@ -148,6 +156,13 @@ class MqttSolarService {
   MqttConnectionStateStatus get status => _status;
   bool get isUsingCloud => _usingCloud;
 
+  bool get isServerLive {
+    if (_status != MqttConnectionStateStatus.connected) return false;
+    final lastFresh = _lastFreshTelemetryAt;
+    if (lastFresh == null) return false;
+    return DateTime.now().difference(lastFresh).inSeconds <= 25;
+  }
+
   MqttDiagnosticsSnapshot get currentDiagnostics => MqttDiagnosticsSnapshot(
         targetHost: _currentHost,
         targetPort: _currentPort,
@@ -160,6 +175,8 @@ class MqttSolarService {
         steps: _steps.isEmpty ? _buildDefaultSteps() : _steps,
         isCloudConnection: _usingCloud,
         cloudConfigured: _cloudHost.isNotEmpty,
+        isServerLive: isServerLive,
+        lastTelemetryEpochMs: _lastTelemetryEpochMs,
       );
 
   List<ConnectionStepInfo> _buildDefaultSteps() {
@@ -580,22 +597,49 @@ class MqttSolarService {
           try {
             final decoded = jsonDecode(payloadString) as Map<String, dynamic>;
             if (event.topic == topicTelemetry) {
+              final nowMs = DateTime.now().millisecondsSinceEpoch;
+              final msgEpochMs = (decoded['epoch_ms'] as num?)?.toInt();
+              final bool isRecent =
+                  msgEpochMs != null && (nowMs - msgEpochMs).abs() <= 45000;
+              final bool isStrictlyNewer = msgEpochMs != null &&
+                  _lastTelemetryEpochMs != null &&
+                  msgEpochMs > _lastTelemetryEpochMs!;
+
+              if (msgEpochMs != null) {
+                _lastTelemetryEpochMs = msgEpochMs;
+              }
+              if (isRecent || isStrictlyNewer) {
+                _lastFreshTelemetryAt = DateTime.now();
+              }
+
               _telemetryController.add(decoded);
-              if (_packetsReceived == 1 || _packetsReceived % 5 == 0) {
+              if (_packetsReceived == 1 || _packetsReceived % 5 == 0 || !isRecent) {
                 final src = decoded['source_mode'] ?? 'Inversor';
+                final ageSec = msgEpochMs != null
+                    ? ((nowMs - msgEpochMs) ~/ 1000).clamp(0, 999999)
+                    : 0;
+                final staleMsg = !isRecent && !isStrictlyNewer
+                    ? 'Último dato de hace ${_formatAge(ageSec)} • Esperando servidor Mac...'
+                    : null;
                 _emitDiagnostics(
                   step: 5,
-                  error: null,
+                  error: staleMsg,
                   steps: _buildConnectedSteps(
                     endpoint: endpoint,
                     tcpPingMs: tcpPingMs,
-                    step5Detail:
+                    step5Detail: staleMsg ??
                         'Activo (${endpoint.routeLabel}) • $_packetsReceived lecturas ($src)',
-                    step5Done: true,
+                    step5Done: staleMsg == null,
                   ),
                 );
               }
             } else if (event.topic == topicHistory) {
+              final generatedAt = decoded['generated_at'] as String?;
+              if (generatedAt != null &&
+                  generatedAt == _lastHistoryGeneratedAt) {
+                continue;
+              }
+              _lastHistoryGeneratedAt = generatedAt;
               final pointsRaw = decoded['points'] as List<dynamic>? ?? [];
               final points = pointsRaw
                   .whereType<Map<String, dynamic>>()
@@ -674,23 +718,51 @@ class MqttSolarService {
     );
   }
 
+  String _formatAge(int seconds) {
+    if (seconds < 60) return '${seconds}s';
+    if (seconds < 3600) return '${seconds ~/ 60}m';
+    final hours = seconds ~/ 3600;
+    final mins = (seconds % 3600) ~/ 60;
+    return '${hours}h ${mins}m';
+  }
+
   void _startWatchdog() {
     _watchdogTimer?.cancel();
-    _watchdogTimer = Timer.periodic(const Duration(seconds: 4), (_) {
+    _watchdogTicks = 0;
+    _watchdogTimer = Timer.periodic(const Duration(seconds: 6), (_) async {
       if (_manualDisconnect || _isConnecting) return;
-      final lastRx = _lastMessageReceivedAt;
-      if (lastRx != null &&
-          DateTime.now().difference(lastRx).inSeconds > 7 &&
-          _status == MqttConnectionStateStatus.connected) {
+      if (_status != MqttConnectionStateStatus.connected) return;
+      _watchdogTicks++;
+
+      // Si está conectado por Nube, probar cada ~18s si la red local ya volvió
+      if (_usingCloud && _localHost.isNotEmpty && _watchdogTicks % 3 == 0) {
+        try {
+          final probe = await Socket.connect(
+            _localHost,
+            _localPort,
+            timeout: const Duration(milliseconds: 650),
+          );
+          await probe.close();
+          if (!_manualDisconnect && !_isConnecting && _usingCloud) {
+            reconnectUsingSavedEndpoints();
+            return;
+          }
+        } catch (_) {}
+      }
+
+      // Actualizar indicador si el servidor Mac dejó de emitir telemetría viva (>25s)
+      final lastFresh = _lastFreshTelemetryAt;
+      final stale = lastFresh == null ||
+          DateTime.now().difference(lastFresh).inSeconds > 25;
+      if (stale && !_diagnosticsController.isClosed) {
         _lastError =
-            'Sin paquetes durante >7s; reconectando automáticamente...';
-        reconnectUsingSavedEndpoints();
+            'Broker conectado, pero el servidor en la Mac no ha enviado lecturas recientes.';
+        _diagnosticsController.add(currentDiagnostics);
       }
     });
   }
 
   void _onConnected() {
-    _lastMessageReceivedAt = DateTime.now();
     _updateStatus(MqttConnectionStateStatus.connected);
   }
 

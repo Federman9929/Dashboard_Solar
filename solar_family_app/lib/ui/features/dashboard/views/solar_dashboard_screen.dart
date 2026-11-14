@@ -276,9 +276,11 @@ class SolarDashboardScreen extends StatelessWidget {
     final (String label, Color color) = demoMode
         ? ('MODO DEMO', const Color(0xFF448AFF))
         : switch (status) {
-            MqttConnectionStateStatus.connected => diagnostics.isCloudConnection
-                ? ('EN LÍNEA • NUBE', const Color(0xFF40C4FF))
-                : ('EN LÍNEA (1s)', const Color(0xFF00E676)),
+            MqttConnectionStateStatus.connected => !diagnostics.isServerLive
+                ? ('SERVIDOR OFF', const Color(0xFFFFB300))
+                : diagnostics.isCloudConnection
+                    ? ('EN LÍNEA • NUBE', const Color(0xFF40C4FF))
+                    : ('EN LÍNEA (1s)', const Color(0xFF00E676)),
             MqttConnectionStateStatus.connecting ||
             MqttConnectionStateStatus.reconnecting =>
               (
