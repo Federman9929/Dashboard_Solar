@@ -27,7 +27,7 @@ class NotificationAndAlertService {
 
   static const String _ongoingChannelId = 'solar_ongoing_status_channel';
   static const String _simpleNoticeChannelId = 'solar_battery_notice_channel_v2';
-  static const String _immediateAlarmChannelId = 'solar_battery_alarm_channel_v2';
+  static const String _immediateAlarmChannelId = 'solar_battery_alarm_channel_v3';
 
   bool _isInitialized = false;
   bool _isRinging = false;
@@ -150,6 +150,7 @@ class NotificationAndAlertService {
     String? telegramBotToken,
     String? telegramChatId,
     bool force = false,
+    bool startLoopingRingtone = true,
   }) async {
     if (!_isInitialized) await initialize();
 
@@ -163,10 +164,12 @@ class NotificationAndAlertService {
     _lastCriticalTrigger = now;
 
     if (alertMode == BatteryAlertMode.immediateAlarm) {
-      // 1. Iniciar timbre de alarma continua en bucle
-      _startCriticalAlarmSound();
+      // 1. Iniciar timbre de alarma continua en bucle (cuando corre en primer plano)
+      if (startLoopingRingtone) {
+        _startCriticalAlarmSound();
+      }
 
-      // 2. Notificación de alta prioridad tipo alarma
+      // 2. Notificación de alta prioridad tipo alarma (suena en canal Alarma incluso en 2.º plano)
       final vibrationPattern =
           Int64List.fromList([0, 800, 400, 800, 400, 1200]);
       final androidDetails = AndroidNotificationDetails(
@@ -179,6 +182,8 @@ class NotificationAndAlertService {
         fullScreenIntent: true,
         ongoing: true,
         autoCancel: true,
+        playSound: true,
+        audioAttributesUsage: AudioAttributesUsage.alarm,
         vibrationPattern: vibrationPattern,
         color: const Color(0xFFFF1744),
         colorized: true,

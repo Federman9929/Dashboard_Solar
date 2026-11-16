@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'data/repositories/solar_repository.dart';
+import 'data/services/background_solar_worker.dart';
 import 'data/services/mqtt_solar_service.dart';
 import 'data/services/notification_alert_service.dart';
 import 'ui/features/dashboard/view_models/solar_dashboard_view_model.dart';
@@ -28,7 +29,8 @@ Future<void> main() async {
   // Iniciar la interfaz gráfica inmediatamente sin bloquear la pantalla de arranque
   runApp(SolarFamilyApp(viewModel: dashboardViewModel));
 
-  // Inicializar notificaciones y conexión MQTT en segundo plano
+  // Inicializar notificaciones, tarea periódica de bajo consumo y conexión MQTT en segundo plano
+  unawaited(BackgroundSolarMonitor.initializeAndSchedule());
   unawaited(dashboardViewModel.init());
 }
 

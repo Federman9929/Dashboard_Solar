@@ -1,4 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:solar_family_monitor/data/services/background_solar_worker.dart';
 import 'package:solar_family_monitor/data/services/mqtt_solar_service.dart';
 import 'package:solar_family_monitor/domain/models/battery_alert_mode.dart';
 import 'package:solar_family_monitor/domain/models/solar_energy_stats.dart';
@@ -91,5 +92,64 @@ void main() {
     expect(diag.targetPort, 39882);
 
     await service.dispose();
+  });
+
+  test('BackgroundSolarMonitor filtra lecturas antiguas y respeta cooldown y umbral', () {
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    SolarReading makeReading(double soc, int epochMs) => SolarReading(
+          timestamp: DateTime.fromMillisecondsSinceEpoch(epochMs),
+          epochMs: epochMs,
+          batteryVoltage: 48.0,
+          batterySoc: soc,
+          pvPowerW: 0.0,
+          batteryPowerW: -500.0,
+          batteryChargeW: 0.0,
+          batteryDischargeW: 500.0,
+          loadPowerW: 500.0,
+          status: SolarSystemStatus.discharging,
+          isCritical: soc < 30.0,
+          sourceMode: 'CLOUD',
+        );
+
+    // Lectura vieja (> 25 min) no debe disparar falsa alarma
+    expect(
+      BackgroundSolarMonitor.shouldTriggerBackgroundAlert(
+        reading: makeReading(20.0, nowMs - 30 * 60 * 1000),
+        threshold: 30.0,
+        nowMs: nowMs,
+      ),
+      isFalse,
+    );
+
+    // Lectura fresca bajo el umbral sin cooldown sí dispara
+    expect(
+      BackgroundSolarMonitor.shouldTriggerBackgroundAlert(
+        reading: makeReading(25.0, nowMs - 10 * 1000),
+        threshold: 30.0,
+        nowMs: nowMs,
+      ),
+      isTrue,
+    );
+
+    // Lectura fresca bajo el umbral dentro del cooldown (5 min) no repite
+    expect(
+      BackgroundSolarMonitor.shouldTriggerBackgroundAlert(
+        reading: makeReading(25.0, nowMs - 10 * 1000),
+        threshold: 30.0,
+        nowMs: nowMs,
+        lastAlertEpochMs: nowMs - 5 * 60 * 1000,
+      ),
+      isFalse,
+    );
+
+    // Lectura fresca sobre el umbral no dispara
+    expect(
+      BackgroundSolarMonitor.shouldTriggerBackgroundAlert(
+        reading: makeReading(40.0, nowMs - 10 * 1000),
+        threshold: 30.0,
+        nowMs: nowMs,
+      ),
+      isFalse,
+    );
   });
 }
