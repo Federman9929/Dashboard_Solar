@@ -445,6 +445,16 @@ class LocalHistoryDB:
                 (f"{month_prefix}%",),
             ).fetchone()
 
+            # 4. Desglose diario real de los últimos 31 días para gráficas y tablas PDF
+            daily_rows = conn.execute(
+                """
+                SELECT date_str, pv_energy_kwh, load_energy_kwh, battery_min_soc, battery_max_soc, solar_coverage_percent, solar_start_time
+                FROM daily_energy_stats
+                ORDER BY date_str DESC
+                LIMIT 31
+                """
+            ).fetchall()
+
         # Semana
         pv_week = round(float(cur_week[0] or 0.0), 3)
         load_week = round(float(cur_week[1] or 0.0), 3)
@@ -456,6 +466,20 @@ class LocalHistoryDB:
         load_month = round(float(cur_month[1] or 0.0), 3)
         cov_month = round(min(100.0, (pv_month / max(0.01, load_month)) * 100.0), 1) if load_month > 0 else 100.0
         sav_month = round(load_month * tariff_cop, 0)
+
+        daily_breakdown = [
+            {
+                "date_str": r[0],
+                "pv_energy_kwh": round(float(r[1] or 0.0), 3),
+                "load_energy_kwh": round(float(r[2] or 0.0), 3),
+                "min_soc": round(float(r[3] or 0.0), 1),
+                "max_soc": round(float(r[4] or 100.0), 1),
+                "solar_coverage_percent": round(float(r[5] or 100.0), 1),
+                "savings_cop": round(float(r[2] or 0.0) * tariff_cop, 0),
+                "solar_start_time": str(r[6] or ""),
+            }
+            for r in reversed(daily_rows)
+        ]
 
         return {
             "tariff_cop": tariff_cop,
@@ -474,6 +498,7 @@ class LocalHistoryDB:
                 "solar_coverage_percent": cov_month,
                 "solar_start_time": "",
             },
+            "daily_breakdown": daily_breakdown,
             "updated_at_ms": int(time.time() * 1000),
         }
 
@@ -1284,14 +1309,16 @@ class SolarBackendService:
         Envía automáticamente el reporte semanal consolidado todos los domingos a las 8:00 PM (20:00).
         """
         now = datetime.now()
-        # weekday() == 6 es Domingo, hora 20 es 8:00 PM
+        # weekday() == 6 es Domingo, hora >= 20 es 8:00 PM en adelante
         today_date_str = now.strftime("%Y-%m-%d")
         if now.weekday() == 6 and now.hour == 20:
-            if self._last_weekly_report_date != today_date_str:
+            last_sent = self._last_weekly_report_date or self.db.get_meta("last_weekly_report_date", "")
+            if last_sent != today_date_str:
                 self._last_weekly_report_date = today_date_str
-                self._dispatch_weekly_summary_report()
+                self.db.set_meta("last_weekly_report_date", today_date_str)
+                self._dispatch_weekly_summary_report(today_date_str)
 
-    def _dispatch_weekly_summary_report(self) -> None:
+    def _dispatch_weekly_summary_report(self, date_str: str = "") -> None:
         today_cloud = self._get_today_cloud_summary()
         stats = self.db.get_energy_stats(
             tariff_cop=self.tariff_cop,
@@ -1317,12 +1344,23 @@ class SolarBackendService:
             f"¡Excelente semana de autosuficiencia energética!"
         )
 
-        logger.info(f"Enviando reporte semanal dominical a {self.weekly_report_recipient or 'Telegram'}:\n{report_msg}")
+        # Publicar en MQTT (local + nube) para que la app Android notifique y abra el PDF directo
+        weekly_payload = json.dumps(
+            {
+                "date_str": date_str or datetime.now().strftime("%Y-%m-%d"),
+                "generated_at_ms": int(time.time() * 1000),
+                "tariff_cop": self.tariff_cop,
+                "week": week,
+                "daily_breakdown": stats.get("daily_breakdown", [])[-7:],
+            }
+        )
+        self._publish_all("hogar/solar/reporte_semanal", weekly_payload, qos=1, retain=True)
+        logger.info(f"📊 Reporte semanal dominical publicado en MQTT y canales configurados:\n{report_msg}")
 
-        # Enviar vía Telegram si el bot está configurado o si se especificó chat_id
+        # Enviar vía Telegram si el bot tiene credenciales reales configuradas
         tg_token = self.alert_manager.telegram_token
         target_chat = self.weekly_report_recipient if (self.weekly_report_recipient and not self.weekly_report_recipient.startswith("+")) else self.alert_manager.telegram_chat_id
-        if tg_token and target_chat:
+        if tg_token and not tg_token.startswith("123456789:") and target_chat and not target_chat.startswith("-100123456"):
             try:
                 requests.post(
                     f"https://api.telegram.org/bot{tg_token}/sendMessage",
@@ -1332,8 +1370,9 @@ class SolarBackendService:
             except Exception as e:
                 logger.error(f"Fallo enviando reporte semanal a Telegram: {e}")
 
-        # Enviar vía CallMeBot / WhatsApp si hay número telefónico configurado
-        if self.weekly_report_recipient and self.weekly_report_recipient.startswith("+"):
+        # Enviar vía CallMeBot / WhatsApp si hay teléfono y apikey real configurada
+        callmebot_key = os.getenv("CALLMEBOT_APIKEY", "").strip()
+        if self.weekly_report_recipient and self.weekly_report_recipient.startswith("+") and callmebot_key and callmebot_key != "123456":
             try:
                 phone_clean = self.weekly_report_recipient.replace("+", "").strip()
                 requests.get(
@@ -1341,7 +1380,7 @@ class SolarBackendService:
                     params={
                         "phone": phone_clean,
                         "text": report_msg.replace("*", ""),
-                        "apikey": os.getenv("CALLMEBOT_APIKEY", "123456"),
+                        "apikey": callmebot_key,
                     },
                     timeout=8,
                 )

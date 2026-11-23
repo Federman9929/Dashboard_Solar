@@ -24,9 +24,11 @@ class NotificationAndAlertService {
   final FlutterRingtonePlayer _ringtonePlayer = FlutterRingtonePlayer();
 
   static const int _ongoingNotificationId = 1001;
+  static const int _weeklyReportNotificationId = 2020;
   static const int _criticalAlertNotificationId = 9999;
 
   static const String _ongoingChannelId = 'solar_ongoing_status_channel';
+  static const String _weeklyReportChannelId = 'solar_weekly_report_channel';
   static const String _simpleNoticeChannelId = 'solar_battery_notice_channel_v2';
   static const String _immediateAlarmChannelId = 'solar_battery_alarm_channel_v3';
 
@@ -335,6 +337,40 @@ class NotificationAndAlertService {
     } catch (e) {
       debugPrint('Error al silenciar alarma: $e');
     }
+  }
+
+  /// Notifica los domingos desde las 8:00 PM que el reporte semanal PDF está listo.
+  Future<void> showWeeklyReportReadyNotification({
+    required double savingsCop,
+    required double loadKwh,
+    required double pvKwh,
+    bool requestPermissions = true,
+  }) async {
+    if (!_isInitialized) {
+      await initialize(requestPermissions: requestPermissions);
+    }
+    final savingsInt = savingsCop.round();
+    final androidDetails = AndroidNotificationDetails(
+      _weeklyReportChannelId,
+      'Reporte Semanal Solar',
+      channelDescription: 'Resumen semanal automático los domingos a las 8:00 PM',
+      importance: Importance.high,
+      priority: Priority.high,
+      color: const Color(0xFF00E676),
+      visibility: NotificationVisibility.public,
+    );
+    const iosDetails = DarwinNotificationDetails(
+      presentAlert: true,
+      presentBadge: true,
+      presentSound: true,
+    );
+
+    await _notificationsPlugin.show(
+      _weeklyReportNotificationId,
+      '📊 Reporte Semanal Solar (Domingo 8 PM)',
+      'Ahorro semanal: \$$savingsInt COP • Consumo: ${loadKwh.toStringAsFixed(1)} kWh • Solar: ${pvKwh.toStringAsFixed(1)} kWh. Toca para ver o compartir PDF.',
+      NotificationDetails(android: androidDetails, iOS: iosDetails),
+    );
   }
 
   Future<void> _sendDirectTelegramAlert({

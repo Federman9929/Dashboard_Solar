@@ -83,6 +83,64 @@ class SolarEnergyPeriodStats {
   }
 }
 
+class SolarDailyStat {
+  const SolarDailyStat({
+    required this.dateStr,
+    required this.pvEnergyKwh,
+    required this.loadEnergyKwh,
+    required this.minSoc,
+    required this.maxSoc,
+    required this.solarCoveragePercent,
+    required this.savingsCop,
+    this.solarStartTime = '',
+  });
+
+  final String dateStr;
+  final double pvEnergyKwh;
+  final double loadEnergyKwh;
+  final double minSoc;
+  final double maxSoc;
+  final double solarCoveragePercent;
+  final double savingsCop;
+  final String solarStartTime;
+
+  factory SolarDailyStat.fromJson(Map<String, dynamic> json) {
+    return SolarDailyStat(
+      dateStr: (json['date_str'] as String?) ?? '',
+      pvEnergyKwh: (json['pv_energy_kwh'] as num?)?.toDouble() ?? 0.0,
+      loadEnergyKwh: (json['load_energy_kwh'] as num?)?.toDouble() ?? 0.0,
+      minSoc: (json['min_soc'] as num?)?.toDouble() ?? 0.0,
+      maxSoc: (json['max_soc'] as num?)?.toDouble() ?? 100.0,
+      solarCoveragePercent:
+          (json['solar_coverage_percent'] as num?)?.toDouble() ?? 100.0,
+      savingsCop: (json['savings_cop'] as num?)?.toDouble() ?? 0.0,
+      solarStartTime: (json['solar_start_time'] as String?) ?? '',
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+        'date_str': dateStr,
+        'pv_energy_kwh': pvEnergyKwh,
+        'load_energy_kwh': loadEnergyKwh,
+        'min_soc': minSoc,
+        'max_soc': maxSoc,
+        'solar_coverage_percent': solarCoveragePercent,
+        'savings_cop': savingsCop,
+        'solar_start_time': solarStartTime,
+      };
+
+  SolarDailyStat withTariff(double tariffCop) => SolarDailyStat(
+        dateStr: dateStr,
+        pvEnergyKwh: pvEnergyKwh,
+        loadEnergyKwh: loadEnergyKwh,
+        minSoc: minSoc,
+        maxSoc: maxSoc,
+        solarCoveragePercent: solarCoveragePercent,
+        savingsCop: loadEnergyKwh * tariffCop,
+        solarStartTime: solarStartTime,
+      );
+}
+
 class SolarEnergyStatsBundle {
   const SolarEnergyStatsBundle({
     required this.tariffCop,
@@ -91,6 +149,7 @@ class SolarEnergyStatsBundle {
     required this.month,
     required this.updatedAtMs,
     this.isFromBackend = false,
+    this.dailyBreakdown = const [],
   });
 
   final double tariffCop;
@@ -99,6 +158,7 @@ class SolarEnergyStatsBundle {
   final SolarEnergyPeriodStats month;
   final int updatedAtMs;
   final bool isFromBackend;
+  final List<SolarDailyStat> dailyBreakdown;
 
   factory SolarEnergyStatsBundle.initial({double tariff = 850.0}) {
     return SolarEnergyStatsBundle(
@@ -108,6 +168,7 @@ class SolarEnergyStatsBundle {
       month: SolarEnergyPeriodStats.empty('Mes'),
       updatedAtMs: DateTime.now().millisecondsSinceEpoch,
       isFromBackend: false,
+      dailyBreakdown: const [],
     );
   }
 
@@ -116,6 +177,11 @@ class SolarEnergyStatsBundle {
     bool isFromBackend = true,
   }) {
     final tariff = (json['tariff_cop'] as num?)?.toDouble() ?? 850.0;
+    final rawDaily = json['daily_breakdown'] as List<dynamic>? ?? const [];
+    final dailyList = rawDaily
+        .whereType<Map<String, dynamic>>()
+        .map(SolarDailyStat.fromJson)
+        .toList(growable: false);
     return SolarEnergyStatsBundle(
       tariffCop: tariff,
       day: json['day'] is Map<String, dynamic>
@@ -133,6 +199,7 @@ class SolarEnergyStatsBundle {
       updatedAtMs: (json['updated_at_ms'] as num?)?.toInt() ??
           DateTime.now().millisecondsSinceEpoch,
       isFromBackend: isFromBackend,
+      dailyBreakdown: dailyList,
     );
   }
 
@@ -141,6 +208,7 @@ class SolarEnergyStatsBundle {
         'day': day.toJson(),
         'week': week.toJson(),
         'month': month.toJson(),
+        'daily_breakdown': dailyBreakdown.map((e) => e.toJson()).toList(),
         'updated_at_ms': updatedAtMs,
       };
 
@@ -152,6 +220,9 @@ class SolarEnergyStatsBundle {
       month: month.withTariff(newTariffCop),
       updatedAtMs: updatedAtMs,
       isFromBackend: isFromBackend,
+      dailyBreakdown: dailyBreakdown
+          .map((d) => d.withTariff(newTariffCop))
+          .toList(growable: false),
     );
   }
 
@@ -161,14 +232,34 @@ class SolarEnergyStatsBundle {
     required double tariffCop,
     String? startTimeIfEmpty,
   }) {
+    final newDay = day.addDelta(
+      deltaPvKwh: deltaPvKwh,
+      deltaLoadKwh: deltaLoadKwh,
+      tariffCop: tariffCop,
+      startTimeOverride: startTimeIfEmpty,
+    );
+    final now = DateTime.now();
+    final todayKey =
+        '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+    final updatedDaily = dailyBreakdown.isEmpty
+        ? const <SolarDailyStat>[]
+        : dailyBreakdown.map((d) {
+            if (d.dateStr != todayKey) return d;
+            return SolarDailyStat(
+              dateStr: d.dateStr,
+              pvEnergyKwh: newDay.pvEnergyKwh,
+              loadEnergyKwh: newDay.loadEnergyKwh,
+              minSoc: d.minSoc,
+              maxSoc: d.maxSoc,
+              solarCoveragePercent: newDay.solarCoveragePercent,
+              savingsCop: newDay.savingsCop,
+              solarStartTime: newDay.solarStartTime,
+            );
+          }).toList(growable: false);
+
     return SolarEnergyStatsBundle(
       tariffCop: tariffCop,
-      day: day.addDelta(
-        deltaPvKwh: deltaPvKwh,
-        deltaLoadKwh: deltaLoadKwh,
-        tariffCop: tariffCop,
-        startTimeOverride: startTimeIfEmpty,
-      ),
+      day: newDay,
       week: week.addDelta(
         deltaPvKwh: deltaPvKwh,
         deltaLoadKwh: deltaLoadKwh,
@@ -181,6 +272,7 @@ class SolarEnergyStatsBundle {
       ),
       updatedAtMs: DateTime.now().millisecondsSinceEpoch,
       isFromBackend: isFromBackend,
+      dailyBreakdown: updatedDaily,
     );
   }
 }

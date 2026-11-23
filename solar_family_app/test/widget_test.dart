@@ -1,6 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:solar_family_monitor/data/services/background_solar_worker.dart';
 import 'package:solar_family_monitor/data/services/mqtt_solar_service.dart';
+import 'package:solar_family_monitor/data/services/solar_pdf_report_service.dart';
 import 'package:solar_family_monitor/domain/models/battery_alert_mode.dart';
 import 'package:solar_family_monitor/domain/models/solar_energy_stats.dart';
 import 'package:solar_family_monitor/domain/models/solar_reading.dart';
@@ -193,5 +194,96 @@ void main() {
       sourceMode: 'SMARTESS_CLOUD',
     );
     expect(chargingSolar.shouldTriggerLowBatteryAlert(threshold: 30.0), isFalse);
+  });
+
+  test('SolarPdfReportService genera PDF válido con gráficas y tablas para Día y Semana', () async {
+    final now = DateTime.now();
+    final midnight = DateTime(now.year, now.month, now.day);
+    final timeline = List.generate(12, (i) {
+      final t = midnight.add(Duration(hours: i * 2));
+      return SolarReading(
+        timestamp: t,
+        epochMs: t.millisecondsSinceEpoch,
+        batteryVoltage: 52.0 + (i % 3) * 0.4,
+        batterySoc: 40.0 + i * 4.0,
+        pvPowerW: (i >= 3 && i <= 8) ? 1400.0 : 0.0,
+        batteryPowerW: (i >= 3 && i <= 8) ? 600.0 : -450.0,
+        batteryChargeW: (i >= 3 && i <= 8) ? 600.0 : 0.0,
+        batteryDischargeW: (i >= 3 && i <= 8) ? 0.0 : 450.0,
+        loadPowerW: 550.0,
+        status: (i >= 3 && i <= 8)
+            ? SolarSystemStatus.charging
+            : SolarSystemStatus.discharging,
+        isCritical: false,
+        sourceMode: 'SMARTESS_CLOUD',
+      );
+    });
+
+    final stats = SolarEnergyStatsBundle.fromJson({
+      'tariff_cop': 850.0,
+      'day': {
+        'pv_energy_kwh': 9.3,
+        'load_energy_kwh': 8.7,
+        'savings_cop': 7395.0,
+        'solar_coverage_percent': 100.0,
+        'solar_start_time': '08:25',
+      },
+      'week': {
+        'pv_energy_kwh': 65.0,
+        'load_energy_kwh': 52.0,
+        'savings_cop': 44200.0,
+        'solar_coverage_percent': 100.0,
+      },
+      'month': {
+        'pv_energy_kwh': 150.0,
+        'load_energy_kwh': 120.0,
+        'savings_cop': 102000.0,
+        'solar_coverage_percent': 100.0,
+      },
+      'daily_breakdown': [
+        {
+          'date_str': '2026-11-21',
+          'pv_energy_kwh': 9.0,
+          'load_energy_kwh': 6.6,
+          'min_soc': 12.0,
+          'max_soc': 100.0,
+          'solar_coverage_percent': 100.0,
+          'savings_cop': 5610.0,
+          'solar_start_time': '08:57',
+        },
+        {
+          'date_str': '2026-11-22',
+          'pv_energy_kwh': 9.3,
+          'load_energy_kwh': 8.7,
+          'min_soc': 5.0,
+          'max_soc': 98.4,
+          'solar_coverage_percent': 100.0,
+          'savings_cop': 7395.0,
+          'solar_start_time': '10:11',
+        },
+      ],
+    });
+
+    final dayBytes = await SolarPdfReportService.buildPdfBytes(
+      periodName: 'Día',
+      stats: stats,
+      currentReading: timeline.last,
+      autonomyText: '6h 15m hasta 30%',
+      criticalThreshold: 30.0,
+      timeline: timeline,
+    );
+    expect(dayBytes.length, greaterThan(1500));
+    expect(String.fromCharCodes(dayBytes.take(4)), '%PDF');
+
+    final weekBytes = await SolarPdfReportService.buildPdfBytes(
+      periodName: 'Semana',
+      stats: stats,
+      currentReading: timeline.last,
+      autonomyText: '6h 15m hasta 30%',
+      criticalThreshold: 30.0,
+      timeline: timeline,
+    );
+    expect(weekBytes.length, greaterThan(1500));
+    expect(String.fromCharCodes(weekBytes.take(4)), '%PDF');
   });
 }

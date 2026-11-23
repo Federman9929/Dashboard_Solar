@@ -9,6 +9,7 @@ import '../../domain/models/solar_energy_stats.dart';
 import '../../domain/models/solar_reading.dart';
 import '../services/mqtt_solar_service.dart';
 import '../services/notification_alert_service.dart';
+import '../services/solar_home_widget_service.dart';
 
 /// Repositorio central del sistema solar familiar.
 /// Coordina la conexión MQTT local con la MacBook, conserva las ventanas de
@@ -477,10 +478,17 @@ class SolarRepository {
       _lastLiveStatsEpochMs = nowMs;
     }
 
-    // 3. Actualizar Notificación Permanente (con limitador de 15s para no bloquear Android)
+    // 3. Actualizar Notificación Permanente y Widget de Inicio (con limitador para no bloquear Android)
     _notificationService.updatePersistentNotification(
       reading,
       threshold: _criticalSocThreshold,
+    );
+    unawaited(
+      SolarHomeWidgetService.updateFromReading(
+        reading: reading,
+        todaySavingsCop: _currentStats.day.savingsCop,
+        threshold: _criticalSocThreshold,
+      ),
     );
 
     // 4. Evaluar umbral crítico configurable por el usuario (solo si hay carga activa en casa y está descargando)

@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:printing/printing.dart';
 import 'package:share_plus/share_plus.dart';
 
+import 'package:solar_family_monitor/data/services/solar_pdf_report_service.dart';
 import 'package:solar_family_monitor/domain/models/solar_energy_stats.dart';
 import 'package:solar_family_monitor/domain/models/solar_reading.dart';
 import 'package:solar_family_monitor/ui/features/dashboard/view_models/solar_dashboard_view_model.dart';
@@ -23,6 +25,7 @@ class SolarReportsView extends StatefulWidget {
 class _SolarReportsViewState extends State<SolarReportsView> {
   int _selectedPeriodIndex = 0; // 0: Día, 1: Semana, 2: Mes
   int _reportExportPeriodIndex = 0; // 0: Día, 1: Semana, 2: Mes
+  bool _isGeneratingPdf = false;
 
   static const List<String> _periods = ['Día', 'Semana', 'Mes'];
 
@@ -86,15 +89,74 @@ ${batteryLine}⏳ Autonomía: $autonomy
 Monitor Solar Familiar''';
   }
 
-  Future<void> _shareReport(int periodIndex) async {
+  Future<void> _openPdfPreview(BuildContext context, int periodIndex) async {
     final String periodName = _periods[periodIndex];
-    final String reportText = _buildReportText(periodIndex);
-    await SharePlus.instance.share(
-      ShareParams(
-        text: reportText,
-        subject: 'Informe Solar Familiar - $periodName',
+    final vm = widget.viewModel;
+    final reading = widget.currentReading;
+    final stats = vm.energyStats;
+    final autonomy = vm.autonomyText;
+    final threshold = vm.criticalSocThreshold;
+    final timeline = List<SolarReading>.from(vm.unifiedTimeline);
+
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => Scaffold(
+          backgroundColor: const Color(0xFF0B101B),
+          appBar: AppBar(
+            backgroundColor: const Color(0xFF161F30),
+            title: Text('Informe PDF • $periodName'),
+          ),
+          body: PdfPreview(
+            canChangeOrientation: false,
+            canChangePageFormat: false,
+            pdfFileName:
+                'Informe_Solar_${periodName.toLowerCase().replaceAll('í', 'i')}.pdf',
+            build: (_) => SolarPdfReportService.buildPdfBytes(
+              periodName: periodName,
+              stats: stats,
+              currentReading: reading,
+              autonomyText: autonomy,
+              criticalThreshold: threshold,
+              timeline: timeline,
+            ),
+          ),
+        ),
       ),
     );
+  }
+
+  Future<void> _sharePdfReport(BuildContext context, int periodIndex) async {
+    if (_isGeneratingPdf) return;
+    setState(() => _isGeneratingPdf = true);
+    try {
+      final String periodName = _periods[periodIndex];
+      final vm = widget.viewModel;
+      final file = await SolarPdfReportService.generateAndSavePdf(
+        periodName: periodName,
+        stats: vm.energyStats,
+        currentReading: widget.currentReading,
+        autonomyText: vm.autonomyText,
+        criticalThreshold: vm.criticalSocThreshold,
+        timeline: List<SolarReading>.from(vm.unifiedTimeline),
+      );
+      await SharePlus.instance.share(
+        ShareParams(
+          files: [XFile(file.path)],
+          text: '☀️ Informe Solar Familiar ($periodName)',
+          subject: 'Informe Solar Familiar - $periodName',
+        ),
+      );
+    } catch (e) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error generando PDF: $e')),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isGeneratingPdf = false);
+      }
+    }
   }
 
   Future<void> _copyReport(BuildContext context, int periodIndex) async {
@@ -458,17 +520,18 @@ Monitor Solar Familiar''';
                     flex: 2,
                     child: ElevatedButton.icon(
                       style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFF40C4FF),
+                        backgroundColor: const Color(0xFF00E676),
                         foregroundColor: Colors.black,
                         padding: const EdgeInsets.symmetric(vertical: 12),
                         shape: RoundedRectangleBorder(
                           borderRadius: BorderRadius.circular(10),
                         ),
                       ),
-                      onPressed: () => _shareReport(_reportExportPeriodIndex),
-                      icon: const Icon(Icons.share_rounded, size: 18),
+                      onPressed: () =>
+                          _openPdfPreview(context, _reportExportPeriodIndex),
+                      icon: const Icon(Icons.picture_as_pdf_rounded, size: 18),
                       label: const Text(
-                        'Generar y Compartir',
+                        'Ver PDF',
                         style: TextStyle(
                             fontWeight: FontWeight.w800, fontSize: 13),
                       ),
@@ -476,24 +539,50 @@ Monitor Solar Familiar''';
                   ),
                   const SizedBox(width: 8),
                   Expanded(
-                    child: OutlinedButton.icon(
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: Colors.white70,
-                        side: const BorderSide(color: Colors.white24),
+                    flex: 2,
+                    child: ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF40C4FF),
+                        foregroundColor: Colors.black,
                         padding: const EdgeInsets.symmetric(vertical: 12),
                         shape: RoundedRectangleBorder(
                           borderRadius: BorderRadius.circular(10),
                         ),
                       ),
-                      onPressed: () =>
-                          _copyReport(context, _reportExportPeriodIndex),
-                      icon: const Icon(Icons.copy_rounded, size: 16),
+                      onPressed: _isGeneratingPdf
+                          ? null
+                          : () => _sharePdfReport(
+                              context, _reportExportPeriodIndex),
+                      icon: _isGeneratingPdf
+                          ? const SizedBox(
+                              width: 14,
+                              height: 14,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.black,
+                              ),
+                            )
+                          : const Icon(Icons.share_rounded, size: 18),
                       label: const Text(
-                        'Copiar',
+                        'Enviar PDF',
                         style: TextStyle(
-                            fontWeight: FontWeight.w700, fontSize: 12),
+                            fontWeight: FontWeight.w800, fontSize: 13),
                       ),
                     ),
+                  ),
+                  const SizedBox(width: 6),
+                  IconButton(
+                    tooltip: 'Copiar resumen',
+                    style: IconButton.styleFrom(
+                      foregroundColor: Colors.white70,
+                      side: const BorderSide(color: Colors.white24),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                    ),
+                    onPressed: () =>
+                        _copyReport(context, _reportExportPeriodIndex),
+                    icon: const Icon(Icons.copy_rounded, size: 18),
                   ),
                 ],
               ),

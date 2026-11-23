@@ -1,7 +1,10 @@
 import 'dart:async';
+import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:home_widget/home_widget.dart';
 
 import 'data/repositories/solar_repository.dart';
 import 'data/services/background_solar_worker.dart';
@@ -12,6 +15,12 @@ import 'ui/features/dashboard/views/solar_dashboard_screen.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  if (!kIsWeb && Platform.isAndroid) {
+    unawaited(
+      HomeWidget.registerInteractivityCallback(solarWidgetInteractivityCallback),
+    );
+  }
 
   await SystemChrome.setPreferredOrientations([
     DeviceOrientation.portraitUp,

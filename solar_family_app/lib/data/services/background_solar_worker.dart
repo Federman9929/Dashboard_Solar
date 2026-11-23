@@ -11,9 +11,17 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:workmanager/workmanager.dart';
 
 import '../../domain/models/battery_alert_mode.dart';
+import '../../domain/models/solar_energy_stats.dart';
 import '../../domain/models/solar_reading.dart';
 import 'mqtt_solar_service.dart';
 import 'notification_alert_service.dart';
+import 'solar_home_widget_service.dart';
+
+/// Callback interactivo cuando el usuario toca ↻ directamente en el Widget de inicio.
+@pragma('vm:entry-point')
+Future<void> solarWidgetInteractivityCallback(Uri? uri) async {
+  await BackgroundSolarMonitor.runPeriodicCheck();
+}
 
 /// Dispatcher de WorkManager en aislado nativo de Android.
 /// Vigila la batería periódicamente aunque la app esté cerrada, conectándose
@@ -26,6 +34,12 @@ void solarBackgroundDispatcher() {
   });
 }
 
+class _BgMqttSnapshot {
+  _BgMqttSnapshot({this.reading, this.stats});
+  final SolarReading? reading;
+  final SolarEnergyStatsBundle? stats;
+}
+
 class BackgroundSolarMonitor {
   static const String uniqueTaskName = 'solar_periodic_battery_check';
   static const String taskName = 'solarBatteryCheckTask';
@@ -35,6 +49,7 @@ class BackgroundSolarMonitor {
   static const String prefBgLastAlertMs = 'bg_last_critical_alert_ms';
   static const String prefBgLastCheckMs = 'bg_last_check_ms';
   static const String prefBgLastCheckStatus = 'bg_last_check_status';
+  static const String prefLastSundayReportDate = 'last_sunday_report_date';
 
   static const MethodChannel _batteryOptChannel =
       MethodChannel('com.hogar.solar_family_monitor/battery_opt');
@@ -187,7 +202,7 @@ class BackgroundSolarMonitor {
       final cloudPass = prefs.getString('cloud_mqtt_pass') ?? '';
       final cloudTls = prefs.getBool('cloud_mqtt_tls') ?? true;
 
-      final reading = await _fetchLatestReadingOnce(
+      final snapshot = await _fetchLatestSnapshotOnce(
         localHost: localHost,
         localPort: localPort,
         cloudHost: cloudHost,
@@ -196,10 +211,63 @@ class BackgroundSolarMonitor {
         cloudPass: cloudPass,
         cloudTls: cloudTls,
       );
+      final reading = snapshot?.reading;
       if (reading == null) {
         await _saveBgStatus(prefs, nowMs, 'Sin respuesta MQTT en 2.º plano');
         return true;
       }
+
+      // Actualizar ahorros cacheados + Widget de pantalla de inicio aunque la app esté cerrada
+      final tariffCop = prefs.getDouble('kwh_tariff_cop') ?? 850.0;
+      double todaySavingsCop = 0.0;
+      final fetchedStats = snapshot?.stats?.withTariff(tariffCop);
+      if (fetchedStats != null) {
+        todaySavingsCop = fetchedStats.day.savingsCop;
+        final nowDt = DateTime.now();
+        final todayKey =
+            '${nowDt.year}-${nowDt.month.toString().padLeft(2, '0')}-${nowDt.day.toString().padLeft(2, '0')}';
+        await prefs.setString(
+          'cached_energy_stats_json',
+          jsonEncode(fetchedStats.toJson()),
+        );
+        await prefs.setString('cached_energy_stats_date', todayKey);
+
+        // Si es Domingo >= 8:00 PM, notificar reporte semanal una sola vez ese domingo
+        if (nowDt.weekday == DateTime.sunday && nowDt.hour >= 20) {
+          final lastSundayDate = prefs.getString(prefLastSundayReportDate) ?? '';
+          if (lastSundayDate != todayKey) {
+            await prefs.setString(prefLastSundayReportDate, todayKey);
+            await notificationService.showWeeklyReportReadyNotification(
+              savingsCop: fetchedStats.week.savingsCop,
+              loadKwh: fetchedStats.week.loadEnergyKwh,
+              pvKwh: fetchedStats.week.pvEnergyKwh,
+              requestPermissions: false,
+            );
+          }
+        }
+      } else {
+        final rawCached = prefs.getString('cached_energy_stats_json');
+        final cachedDate = prefs.getString('cached_energy_stats_date');
+        final nowDt = DateTime.now();
+        final todayKey =
+            '${nowDt.year}-${nowDt.month.toString().padLeft(2, '0')}-${nowDt.day.toString().padLeft(2, '0')}';
+        if (rawCached != null && cachedDate == todayKey) {
+          try {
+            final restored = SolarEnergyStatsBundle.fromJson(
+              jsonDecode(rawCached) as Map<String, dynamic>,
+              isFromBackend: false,
+            ).withTariff(tariffCop);
+            todaySavingsCop = restored.day.savingsCop;
+          } catch (_) {}
+        }
+      }
+
+      await SolarHomeWidgetService.updateFromReading(
+        reading: reading,
+        todaySavingsCop: todaySavingsCop,
+        threshold: threshold,
+        force: true,
+      );
 
       final ageMs = (nowMs - reading.epochMs).abs();
       if (ageMs > const Duration(minutes: 25).inMilliseconds) {
@@ -281,7 +349,7 @@ class BackgroundSolarMonitor {
     await prefs.setString(prefBgLastCheckStatus, status);
   }
 
-  static Future<SolarReading?> _fetchLatestReadingOnce({
+  static Future<_BgMqttSnapshot?> _fetchLatestSnapshotOnce({
     required String localHost,
     required int localPort,
     required String cloudHost,
@@ -292,7 +360,7 @@ class BackgroundSolarMonitor {
   }) async {
     final hasCloud = cloudHost.isNotEmpty;
     if (localHost.isNotEmpty) {
-      final reading = await _probeAndReadOnce(
+      final snap = await _probeAndReadOnce(
         host: localHost,
         port: localPort,
         useTls: false,
@@ -300,7 +368,7 @@ class BackgroundSolarMonitor {
         password: '',
         tcpTimeout: Duration(milliseconds: hasCloud ? 700 : 1800),
       );
-      if (reading != null) return reading;
+      if (snap?.reading != null) return snap;
     }
     if (hasCloud) {
       return _probeAndReadOnce(
@@ -315,7 +383,7 @@ class BackgroundSolarMonitor {
     return null;
   }
 
-  static Future<SolarReading?> _probeAndReadOnce({
+  static Future<_BgMqttSnapshot?> _probeAndReadOnce({
     required String host,
     required int port,
     required bool useTls,
@@ -356,28 +424,41 @@ class BackgroundSolarMonitor {
         return null;
       }
 
-      final completer = Completer<SolarReading?>();
+      SolarReading? gotReading;
+      SolarEnergyStatsBundle? gotStats;
+      final completer = Completer<_BgMqttSnapshot?>();
+
       sub = client.updates?.listen((events) {
         if (completer.isCompleted) return;
         for (final event in events) {
-          if (event.topic != MqttSolarService.topicTelemetry) continue;
           final msg = event.payload as MqttPublishMessage?;
           if (msg == null) continue;
           final raw =
               MqttPublishPayload.bytesToStringAsString(msg.payload.message);
           try {
             final map = jsonDecode(raw) as Map<String, dynamic>;
-            completer.complete(SolarReading.fromJson(map));
-            return;
+            if (event.topic == MqttSolarService.topicTelemetry) {
+              gotReading = SolarReading.fromJson(map);
+            } else if (event.topic == MqttSolarService.topicStats) {
+              gotStats = SolarEnergyStatsBundle.fromJson(
+                map,
+                isFromBackend: true,
+              );
+            }
           } catch (_) {}
+        }
+        if (gotReading != null && gotStats != null && !completer.isCompleted) {
+          completer.complete(_BgMqttSnapshot(reading: gotReading, stats: gotStats));
         }
       });
 
       client.subscribe(MqttSolarService.topicTelemetry, MqttQos.atMostOnce);
+      client.subscribe(MqttSolarService.topicStats, MqttQos.atMostOnce);
 
       return await completer.future.timeout(
         const Duration(seconds: 4),
-        onTimeout: () => null,
+        onTimeout: () =>
+            gotReading != null ? _BgMqttSnapshot(reading: gotReading, stats: gotStats) : null,
       );
     } catch (_) {
       return null;
