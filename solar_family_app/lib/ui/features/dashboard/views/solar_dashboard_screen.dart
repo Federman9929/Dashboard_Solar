@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
+import 'package:solar_family_monitor/data/services/background_solar_worker.dart';
 import 'package:solar_family_monitor/data/services/mqtt_solar_service.dart';
 import 'package:solar_family_monitor/domain/models/battery_alert_mode.dart';
 import 'package:solar_family_monitor/domain/models/solar_reading.dart';
@@ -1156,6 +1158,8 @@ class SolarDashboardScreen extends StatelessWidget {
                         ),
                       ],
                     ),
+                    const SizedBox(height: 10),
+                    const _BackgroundAlertReliabilityPanel(),
                     const Divider(color: Colors.white12, height: 24),
                     const Text(
                       'Ahorro e Informes Semanales',
@@ -1358,6 +1362,154 @@ class SolarDashboardScreen extends StatelessWidget {
           },
         );
       },
+    );
+  }
+}
+
+class _BackgroundAlertReliabilityPanel extends StatefulWidget {
+  const _BackgroundAlertReliabilityPanel();
+
+  @override
+  State<_BackgroundAlertReliabilityPanel> createState() =>
+      _BackgroundAlertReliabilityPanelState();
+}
+
+class _BackgroundAlertReliabilityPanelState
+    extends State<_BackgroundAlertReliabilityPanel> {
+  bool? _ignoringBatteryOpt;
+  String _lastCheckText = 'Sin registros aún';
+  String? _testNotice;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadStatus();
+  }
+
+  Future<void> _loadStatus() async {
+    final ignoring =
+        await BackgroundSolarMonitor.isIgnoringBatteryOptimizations();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.reload();
+    final ms = prefs.getInt(BackgroundSolarMonitor.prefBgLastCheckMs);
+    final status =
+        prefs.getString(BackgroundSolarMonitor.prefBgLastCheckStatus);
+
+    String formatted = 'Pendiente de primer ciclo (~15m)';
+    if (ms != null && status != null) {
+      final dt = DateTime.fromMillisecondsSinceEpoch(ms);
+      final hh = dt.hour.toString().padLeft(2, '0');
+      final mm = dt.minute.toString().padLeft(2, '0');
+      formatted = '$hh:$mm • $status';
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _ignoringBatteryOpt = ignoring;
+      _lastCheckText = formatted;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isExempt = _ignoringBatteryOpt ?? true;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: const Color(0xFF0E1522),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: isExempt
+              ? const Color(0xFF00E676).withValues(alpha: 0.3)
+              : const Color(0xFFFFB300).withValues(alpha: 0.5),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '2.º plano: $_lastCheckText',
+            style: const TextStyle(color: Colors.white70, fontSize: 11),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: isExempt
+                        ? const Color(0xFF00E676)
+                        : const Color(0xFFFFB300),
+                    side: BorderSide(
+                      color: isExempt
+                          ? const Color(0xFF00E676).withValues(alpha: 0.45)
+                          : const Color(0xFFFFB300),
+                    ),
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                  ),
+                  onPressed: () async {
+                    await BackgroundSolarMonitor
+                        .requestIgnoreBatteryOptimizations();
+                    await Future<void>.delayed(
+                      const Duration(milliseconds: 600),
+                    );
+                    await _loadStatus();
+                  },
+                  icon: Icon(
+                    isExempt
+                        ? Icons.verified_user_rounded
+                        : Icons.battery_saver_rounded,
+                    size: 15,
+                  ),
+                  label: Text(
+                    isExempt ? 'Sin ahorro ✓' : 'Permitir 2.º plano',
+                    style: const TextStyle(fontSize: 11),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: const Color(0xFF40C4FF),
+                    side: BorderSide(
+                      color: const Color(0xFF40C4FF).withValues(alpha: 0.45),
+                    ),
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                  ),
+                  onPressed: () async {
+                    final scheduled = await BackgroundSolarMonitor
+                        .scheduleBackgroundTestIn5Seconds();
+                    if (!mounted) return;
+                    setState(() {
+                      _testNotice = scheduled
+                          ? '⏳ Cierra o bloquea el celular ahora: la alerta llegará en ~5s.'
+                          : 'Prueba disponible en dispositivo Android.';
+                    });
+                  },
+                  icon: const Icon(Icons.notifications_active_rounded, size: 15),
+                  label: const Text(
+                    'Probar en 5s',
+                    style: TextStyle(fontSize: 11),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          if (_testNotice != null) ...[
+            const SizedBox(height: 6),
+            Text(
+              _testNotice!,
+              style: const TextStyle(
+                color: Color(0xFF40C4FF),
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ],
+      ),
     );
   }
 }

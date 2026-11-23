@@ -15,6 +15,7 @@
     <!-- Permisos para Alerta Crítica (<30% batería) tipo llamada entrante y vibración -->
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
     <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
         android:label="Monitor Solar"

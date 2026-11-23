@@ -37,7 +37,7 @@ class NotificationAndAlertService {
 
   bool get isRinging => _isRinging;
 
-  Future<void> initialize() async {
+  Future<void> initialize({bool requestPermissions = true}) async {
     if (_isInitialized) return;
 
     const androidSettings =
@@ -63,11 +63,18 @@ class NotificationAndAlertService {
       },
     );
 
-    // Solicitar permisos en Android 13+
-    final androidImplementation =
-        _notificationsPlugin.resolvePlatformSpecificImplementation<
-            AndroidFlutterLocalNotificationsPlugin>();
-    await androidImplementation?.requestNotificationsPermission();
+    // En aislados en segundo plano (WorkManager) NO existe Activity; solicitar permisos ahí
+    // provoca NullPointerException en flutter_local_notifications y aborta la alerta.
+    if (requestPermissions) {
+      try {
+        final androidImplementation =
+            _notificationsPlugin.resolvePlatformSpecificImplementation<
+                AndroidFlutterLocalNotificationsPlugin>();
+        await androidImplementation?.requestNotificationsPermission();
+      } catch (e) {
+        debugPrint('Aviso solicitando permiso de notificaciones: $e');
+      }
+    }
 
     _isInitialized = true;
   }
@@ -78,8 +85,11 @@ class NotificationAndAlertService {
   Future<void> updatePersistentNotification(
     SolarReading reading, {
     double threshold = 30.0,
+    bool requestPermissions = true,
   }) async {
-    if (!_isInitialized) await initialize();
+    if (!_isInitialized) {
+      await initialize(requestPermissions: requestPermissions);
+    }
 
     final isGreen = reading.isHealthyForThreshold(threshold);
     final now = DateTime.now();
@@ -151,8 +161,12 @@ class NotificationAndAlertService {
     String? telegramChatId,
     bool force = false,
     bool startLoopingRingtone = true,
+    bool requestPermissions = true,
+    Duration? backgroundRingDuration,
   }) async {
-    if (!_isInitialized) await initialize();
+    if (!_isInitialized) {
+      await initialize(requestPermissions: requestPermissions);
+    }
 
     final now = DateTime.now();
     // Cooldown de 3 minutos para no saturar notificaciones repetidas, salvo prueba manual
@@ -164,8 +178,8 @@ class NotificationAndAlertService {
     _lastCriticalTrigger = now;
 
     if (alertMode == BatteryAlertMode.immediateAlarm) {
-      // 1. Iniciar timbre de alarma continua en bucle (cuando corre en primer plano)
-      if (startLoopingRingtone) {
+      // 1. Iniciar timbre de alarma continua en bucle (o ráfaga temporizada en 2.º plano)
+      if (startLoopingRingtone || backgroundRingDuration != null) {
         _startCriticalAlarmSound();
       }
 
@@ -204,6 +218,14 @@ class NotificationAndAlertService {
         'Batería bajo el umbral (${threshold.toStringAsFixed(0)}%). Descargando ${reading.batteryDischargeW.toStringAsFixed(0)}W (${reading.batteryVoltage.toStringAsFixed(1)}V). Toca para silenciar.',
         NotificationDetails(android: androidDetails, iOS: iosDetails),
       );
+
+      if (backgroundRingDuration != null) {
+        await Future<void>.delayed(backgroundRingDuration);
+        try {
+          _isRinging = false;
+          await _ringtonePlayer.stop();
+        } catch (_) {}
+      }
     } else {
       // Modo Notificación Sencilla pero Notoria:
       // Tono de aviso del sistema + vibración marcada (sin sirena continua)
