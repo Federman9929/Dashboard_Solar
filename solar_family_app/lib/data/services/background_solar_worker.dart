@@ -109,7 +109,7 @@ class BackgroundSolarMonitor {
     if (ageMs > maxReadingAge.inMilliseconds) {
       return false;
     }
-    if (reading.batterySoc >= threshold) {
+    if (!reading.shouldTriggerLowBatteryAlert(threshold: threshold)) {
       return false;
     }
     if (lastAlertEpochMs != null &&
@@ -217,14 +217,15 @@ class BackgroundSolarMonitor {
         requestPermissions: false,
       );
 
-      // Si la batería se recuperó (+2% histéresis), limpiar cooldown guardado
-      if (reading.batterySoc >= threshold + 2.0) {
+      // Si la carga de la casa se desconectó (red pública), está cargando neto
+      // o ya superó el umbral: silenciar alerta previa y limpiar cooldown.
+      if (!reading.shouldTriggerLowBatteryAlert(threshold: threshold)) {
         await prefs.remove(prefBgLastAlertMs);
-        await _saveBgStatus(
-          prefs,
-          nowMs,
-          'OK • Batería ${reading.batterySoc.toStringAsFixed(1)}%',
-        );
+        await notificationService.stopCriticalAlarmSound();
+        final reason = reading.loadPowerW <= 15.0
+            ? 'En red pública (sin carga) • ${reading.batterySoc.toStringAsFixed(1)}%'
+            : 'OK • Batería ${reading.batterySoc.toStringAsFixed(1)}%';
+        await _saveBgStatus(prefs, nowMs, reason);
         return true;
       }
 

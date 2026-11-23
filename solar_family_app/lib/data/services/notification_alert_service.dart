@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -34,8 +35,15 @@ class NotificationAndAlertService {
   DateTime? _lastOngoingUpdate;
   bool? _lastOngoingIsGreen;
   DateTime? _lastCriticalTrigger;
+  DateTime? _snoozedUntil;
+  Timer? _autoSilenceTimer;
 
   bool get isRinging => _isRinging;
+
+  void resetAlertCooldown() {
+    _lastCriticalTrigger = null;
+    _snoozedUntil = null;
+  }
 
   Future<void> initialize({bool requestPermissions = true}) async {
     if (_isInitialized) return;
@@ -169,10 +177,13 @@ class NotificationAndAlertService {
     }
 
     final now = DateTime.now();
-    // Cooldown de 3 minutos para no saturar notificaciones repetidas, salvo prueba manual
+    // Respetar silencio temporal si el usuario la silenció manualmente, y cooldown de 10 min
+    if (!force && _snoozedUntil != null && now.isBefore(_snoozedUntil!)) {
+      return;
+    }
     if (!force &&
         _lastCriticalTrigger != null &&
-        now.difference(_lastCriticalTrigger!).inMinutes < 3) {
+        now.difference(_lastCriticalTrigger!).inMinutes < 10) {
       return;
     }
     _lastCriticalTrigger = now;
@@ -280,12 +291,20 @@ class NotificationAndAlertService {
 
   void _startCriticalAlarmSound() {
     try {
+      _autoSilenceTimer?.cancel();
       _isRinging = true;
       _ringtonePlayer.playAlarm(
         volume: 1.0,
         looping: true,
         asAlarm: true,
       );
+      // Evitar que suene indefinidamente si no hay nadie cerca del teléfono (máx 30s)
+      _autoSilenceTimer = Timer(const Duration(seconds: 30), () async {
+        try {
+          _isRinging = false;
+          await _ringtonePlayer.stop();
+        } catch (_) {}
+      });
     } catch (e) {
       debugPrint('No se pudo reproducir la alarma de batería: $e');
     }
@@ -303,9 +322,14 @@ class NotificationAndAlertService {
     }
   }
 
-  Future<void> stopCriticalAlarmSound() async {
+  Future<void> stopCriticalAlarmSound({bool snooze = false}) async {
     try {
+      _autoSilenceTimer?.cancel();
+      _autoSilenceTimer = null;
       _isRinging = false;
+      if (snooze) {
+        _snoozedUntil = DateTime.now().add(const Duration(minutes: 15));
+      }
       await _ringtonePlayer.stop();
       await _notificationsPlugin.cancel(_criticalAlertNotificationId);
     } catch (e) {

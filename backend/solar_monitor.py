@@ -558,12 +558,21 @@ class CriticalAlertManager:
         mqtt_client: mqtt.Client,
         alert_topic: str,
         publish_fn=None,
+        force: bool = False,
     ) -> None:
-        if telemetry.battery_soc >= self.threshold_soc:
+        should_alert = (
+            telemetry.battery_soc < self.threshold_soc
+            and telemetry.load_power_w > 15.0
+            and telemetry.battery_power_w <= 20.0
+        )
+        if not force and not should_alert:
+            # Si la carga de la casa se desconectó (red pública), está cargando o ya subió del umbral,
+            # reiniciar cooldown para volver a avisar cuando baje de nuevo con carga activa.
+            self.last_alert_time = 0.0
             return
 
         now = time.time()
-        if (now - self.last_alert_time) < self.cooldown_sec:
+        if not force and (now - self.last_alert_time) < self.cooldown_sec:
             return
 
         self.last_alert_time = now
@@ -571,10 +580,13 @@ class CriticalAlertManager:
             f"🚨 ALERTA CRÍTICA SOLAR 🚨\n"
             f"Nivel de batería bajo: {telemetry.battery_soc:.1f}% ({telemetry.battery_voltage:.2f}V)\n"
             f"Estado: {telemetry.status.upper()}\n"
+            f"Consumo casa: {telemetry.load_power_w:.0f} W\n"
             f"Descarga actual: {telemetry.battery_discharge_w:.0f} W\n"
             f"Generación Solar: {telemetry.pv_power_w:.0f} W"
         )
-        logger.warning(f"Disparando alerta crítica de batería (< {self.threshold_soc}%): {telemetry.battery_soc}%")
+        logger.warning(
+            f"Disparando alerta crítica (< {self.threshold_soc}% con carga={telemetry.load_power_w:.0f}W): {telemetry.battery_soc}%"
+        )
 
         # 1. Publicar evento en el tópico de alerta MQTT para que todos los celulares en casa
         # y remotos disparen la alerta inmediatamente
@@ -587,6 +599,8 @@ class CriticalAlertManager:
             "battery_soc": telemetry.battery_soc,
             "battery_voltage": telemetry.battery_voltage,
             "battery_discharge_w": telemetry.battery_discharge_w,
+            "load_power_w": telemetry.load_power_w,
+            "is_test": force,
         }
         payload_str = json.dumps(alert_payload)
         if publish_fn is not None:
@@ -736,7 +750,7 @@ class InverterReader:
             battery_discharge_w=round(discharge_w, 1),
             load_power_w=round(load_w, 1),
             status=status,
-            is_critical=(soc < threshold),
+            is_critical=(soc < threshold and load_w > 15.0 and batt_w <= 20.0),
             source_mode="SMARTESS_CLOUD",
         )
 
@@ -1192,7 +1206,9 @@ class SolarBackendService:
                 sample = self.reader.read_telemetry()
                 sample.battery_soc = max(1.0, self.alert_manager.threshold_soc - 3.5)
                 sample.status = "descargando"
+                sample.battery_power_w = -1450.0
                 sample.battery_discharge_w = 1450.0
+                sample.load_power_w = 1450.0
                 sample.is_critical = True
                 self.alert_manager.last_alert_time = 0.0
                 self.alert_manager.check_and_trigger(
@@ -1200,6 +1216,7 @@ class SolarBackendService:
                     self.mqtt_client,
                     self.topic_alert,
                     publish_fn=self._publish_all,
+                    force=True,
                 )
         except Exception as exc:
             logger.error(f"Error procesando comando MQTT: {exc}")

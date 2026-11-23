@@ -151,5 +151,47 @@ void main() {
       ),
       isFalse,
     );
+
+    // En red pública (loadPowerW == 0, batería al 8%) NO debe disparar alertas
+    final onPublicGrid = SolarReading(
+      timestamp: DateTime.fromMillisecondsSinceEpoch(nowMs),
+      epochMs: nowMs,
+      batteryVoltage: 50.0,
+      batterySoc: 8.0,
+      pvPowerW: 0.0,
+      batteryPowerW: 0.0,
+      batteryChargeW: 0.0,
+      batteryDischargeW: 0.0,
+      loadPowerW: 0.0,
+      status: SolarSystemStatus.idle,
+      isCritical: true,
+      sourceMode: 'SMARTESS_CLOUD',
+    );
+    expect(onPublicGrid.shouldTriggerLowBatteryAlert(threshold: 30.0), isFalse);
+    expect(
+      BackgroundSolarMonitor.shouldTriggerBackgroundAlert(
+        reading: onPublicGrid,
+        threshold: 30.0,
+        nowMs: nowMs,
+      ),
+      isFalse,
+    );
+
+    // Cargando por paneles solares (25% pero carga neta +500 W) NO debe alarmar
+    final chargingSolar = SolarReading(
+      timestamp: DateTime.fromMillisecondsSinceEpoch(nowMs),
+      epochMs: nowMs,
+      batteryVoltage: 51.5,
+      batterySoc: 25.0,
+      pvPowerW: 800.0,
+      batteryPowerW: 500.0,
+      batteryChargeW: 500.0,
+      batteryDischargeW: 0.0,
+      loadPowerW: 300.0,
+      status: SolarSystemStatus.charging,
+      isCritical: false,
+      sourceMode: 'SMARTESS_CLOUD',
+    );
+    expect(chargingSolar.shouldTriggerLowBatteryAlert(threshold: 30.0), isFalse);
   });
 }

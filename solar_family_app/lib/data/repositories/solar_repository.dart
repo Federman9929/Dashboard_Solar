@@ -212,11 +212,14 @@ class SolarRepository {
 
     // Escuchar alertas críticas emitidas por el backend en la MacBook
     _mqttService.alertStream.listen((alertJson) {
+      final isTest = alertJson['is_test'] == true;
       final soc = (alertJson['battery_soc'] as num?)?.toDouble() ?? 25.0;
       final voltage =
           (alertJson['battery_voltage'] as num?)?.toDouble() ?? 46.2;
       final discharge =
           (alertJson['battery_discharge_w'] as num?)?.toDouble() ?? 1200.0;
+      final loadW =
+          (alertJson['load_power_w'] as num?)?.toDouble() ?? discharge;
       final criticalReading = SolarReading(
         timestamp: DateTime.now(),
         epochMs: DateTime.now().millisecondsSinceEpoch,
@@ -226,12 +229,17 @@ class SolarRepository {
         batteryPowerW: -discharge,
         batteryChargeW: 0.0,
         batteryDischargeW: discharge,
-        loadPowerW: discharge,
+        loadPowerW: loadW,
         status: SolarSystemStatus.discharging,
         isCritical: true,
-        sourceMode: 'ALERTA_MQTT',
+        sourceMode: isTest ? 'TEST_ALERTA' : 'ALERTA_MQTT',
       );
-      _triggerCriticalAlertFlow(criticalReading, force: true);
+      if (isTest ||
+          criticalReading.shouldTriggerLowBatteryAlert(
+            threshold: _criticalSocThreshold,
+          )) {
+        _triggerCriticalAlertFlow(criticalReading, force: isTest);
+      }
     });
 
     // Escuchar estadísticas agregadas de energía y ahorro enviadas por la MacBook
@@ -475,12 +483,20 @@ class SolarRepository {
       threshold: _criticalSocThreshold,
     );
 
-    // 4. Evaluar umbral crítico configurable por el usuario
-    if (reading.batterySoc < _criticalSocThreshold) {
-      _triggerCriticalAlertFlow(reading);
-    } else if (_hasActiveAlertBanner) {
-      _hasActiveAlertBanner = false;
-      _criticalAlertBannerController.add(null);
+    // 4. Evaluar umbral crítico configurable por el usuario (solo si hay carga activa en casa y está descargando)
+    final isTest = reading.sourceMode == 'TEST_ALERTA';
+    if (isTest ||
+        reading.shouldTriggerLowBatteryAlert(
+          threshold: _criticalSocThreshold,
+        )) {
+      _triggerCriticalAlertFlow(reading, force: isTest);
+    } else {
+      // Si se desconectó la carga (red pública), subió del umbral o está cargando:
+      // detener alertas y reiniciar cooldown para la próxima vez.
+      _notificationService.resetAlertCooldown();
+      if (_hasActiveAlertBanner || _notificationService.isRinging) {
+        unawaited(silenceCriticalAlert(snooze: false));
+      }
     }
   }
 
@@ -503,14 +519,14 @@ class SolarRepository {
     await prefs.setString(_prefAlertMode, mode.code);
     if (mode == BatteryAlertMode.simpleNotification &&
         _notificationService.isRinging) {
-      await silenceCriticalAlert();
+      await silenceCriticalAlert(snooze: false);
     }
   }
 
-  Future<void> silenceCriticalAlert() async {
+  Future<void> silenceCriticalAlert({bool snooze = true}) async {
     _hasActiveAlertBanner = false;
     _criticalAlertBannerController.add(null);
-    await _notificationService.stopCriticalAlarmSound();
+    await _notificationService.stopCriticalAlarmSound(snooze: snooze);
   }
 
   Future<void> retryConnectionNow() async {
@@ -554,10 +570,12 @@ class SolarRepository {
         latest,
         threshold: _criticalSocThreshold,
       );
-      if (latest.batterySoc < _criticalSocThreshold) {
+      if (latest.shouldTriggerLowBatteryAlert(
+        threshold: _criticalSocThreshold,
+      )) {
         _triggerCriticalAlertFlow(latest, force: true);
       } else {
-        await silenceCriticalAlert();
+        await silenceCriticalAlert(snooze: false);
       }
     }
   }

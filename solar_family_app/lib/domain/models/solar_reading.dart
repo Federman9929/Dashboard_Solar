@@ -53,6 +53,18 @@ class SolarReading {
       (status == SolarSystemStatus.charging ||
           (status == SolarSystemStatus.idle && batterySoc >= threshold));
 
+  /// Indica si se debe disparar alarma/notificación por batería baja:
+  /// Solo alerta cuando la batería está por debajo del umbral, la casa tiene
+  /// carga activa conectada al inversor (> 15 W) y NO está cargándose neto (+20 W).
+  /// Si se desconecta la casa para pasar a red pública (load <= 15 W), deja de alertar.
+  bool shouldTriggerLowBatteryAlert({required double threshold}) {
+    if (batterySoc >= threshold) return false;
+    if (loadPowerW <= 15.0) return false;
+    final bool isNetCharging = batteryPowerW > 20.0 || batteryChargeW > 20.0;
+    if (isNetCharging) return false;
+    return true;
+  }
+
   bool get isHealthyGreen => isHealthyForThreshold(30.0);
 
   String statusEmojiForThreshold(double threshold) =>
